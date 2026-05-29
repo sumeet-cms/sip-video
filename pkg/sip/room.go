@@ -24,6 +24,7 @@ import (
 
 	"github.com/frostbyte73/core"
 	"github.com/pion/webrtc/v4"
+	"github.com/pion/webrtc/v4/pkg/media"
 	"github.com/pkg/errors"
 
 	msdk "github.com/livekit/media-sdk"
@@ -40,6 +41,7 @@ import (
 
 	"github.com/livekit/sip/pkg/config"
 	"github.com/livekit/sip/pkg/media/opus"
+	"github.com/livekit/sip/pkg/media/video"
 )
 
 type RoomStatsSnapshot struct {
@@ -163,6 +165,19 @@ type RoomInterface interface {
 	SendData(data lksdk.DataPacket, opts ...lksdk.DataPublishOption) error
 	NewTrack() *mixer.Input
 	RegisterRPC(method string, handler lksdk.RpcHandlerFunc) error
+
+	// Video
+	VideoEnabled() bool
+	EnableVideo(cfg video.Config, stats *VideoStats) error
+	SwapVideoOutput(w videoSampleWriter) videoSampleWriter
+	NewParticipantVideoTrack() (VideoTrackWriter, error)
+}
+
+// VideoTrackWriter publishes encoded H.264 access units (from the SIP endpoint)
+// into the LiveKit room.
+type VideoTrackWriter interface {
+	WriteSample(media.Sample) error
+	Close() error
 }
 
 type GetRoomFunc func(log logger.Logger, st *RoomStats) RoomInterface
@@ -185,6 +200,14 @@ type Room struct {
 	stopped    core.Fuse
 	closed     core.Fuse
 	stats      *RoomStats
+
+	// Video compositing (room -> SIP). Only active after EnableVideo.
+	videoCfg    video.Config
+	videoStats  *VideoStats
+	videoOut    *gatedVideoWriter // compositor output target (the SIP video writer)
+	videoMu     sync.Mutex
+	comp        video.Compositor
+	videoInputs map[string]video.Input // track SID -> compositor tile
 }
 
 type ParticipantConfig struct {
@@ -289,16 +312,30 @@ func (r *Room) participantLeft(rp *lksdk.RemoteParticipant) {
 
 func (r *Room) subscribeTo(pub *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
 	log := r.roomLog.WithValues("participant", rp.Identity(), "participantID", rp.SID(), "trackID", pub.SID(), "trackName", pub.Name())
-	if pub.Kind() != lksdk.TrackKindAudio {
-		log.Debugw("skipping non-audio track")
-		return
+	switch pub.Kind() {
+	case lksdk.TrackKindAudio:
+		log.Debugw("subscribing to a track")
+		if err := pub.SetSubscribed(true); err != nil {
+			log.Errorw("cannot subscribe to the track", err)
+			return
+		}
+		r.subscribed.Break()
+	case lksdk.TrackKindVideo:
+		// Only subscribe to video when compositing is enabled.
+		if r.comp == nil {
+			log.Debugw("skipping video track - video disabled")
+			return
+		}
+		log.Debugw("subscribing to a video track")
+		// Prefer a medium simulcast layer to limit decode/composite cost.
+		_ = pub.SetVideoQuality(livekit.VideoQuality_MEDIUM)
+		if err := pub.SetSubscribed(true); err != nil {
+			log.Errorw("cannot subscribe to the video track", err)
+			return
+		}
+	default:
+		log.Debugw("skipping unknown track kind")
 	}
-	log.Debugw("subscribing to a track")
-	if err := pub.SetSubscribed(true); err != nil {
-		log.Errorw("cannot subscribe to the track", err)
-		return
-	}
-	r.subscribed.Break()
 }
 
 func (r *Room) Connect(ctx context.Context, conf *config.Config, rconf RoomConfig) error {
@@ -341,6 +378,11 @@ func (r *Room) Connect(ctx context.Context, conf *config.Config, rconf RoomConfi
 						return
 					}
 					defer func() { log.Infow("track closed", "closedAt", time.Now().UnixMilli()) }()
+
+					if track.Kind() == webrtc.RTPCodecTypeVideo {
+						r.handleVideoTrack(log, track, pub, rp)
+						return
+					}
 
 					mTrack := r.NewTrack()
 					if mTrack == nil {
@@ -395,6 +437,9 @@ func (r *Room) Connect(ctx context.Context, conf *config.Config, rconf RoomConfi
 			},
 			OnTrackUnsubscribed: func(track *webrtc.TrackRemote, pub *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
 				r.roomLog.Infow("track unsubscribed", "participant", rp.Identity(), "participantID", rp.SID(), "trackID", track.ID(), "trackName", pub.Name())
+				if track.Kind() == webrtc.RTPCodecTypeVideo {
+					r.removeVideoInput(pub.SID())
+				}
 			},
 		},
 		OnDisconnected: func() {
@@ -540,6 +585,7 @@ func (r *Room) CloseWithReason(reason livekit.DisconnectReason) error {
 		r.subscribe.Store(false)
 		err = r.CloseOutput()
 		r.SetDTMFOutput(nil)
+		r.closeVideo()
 		if r.room != nil {
 			r.room.DisconnectWithReason(reason)
 			r.room = nil

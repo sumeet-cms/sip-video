@@ -73,6 +73,44 @@ type TCPConfig struct {
 	DialPort rtcconfig.PortRange `yaml:"dial_port"`
 }
 
+// VideoConfig controls bidirectional H.264 video over SIP.
+type VideoConfig struct {
+	Enabled bool `yaml:"enabled"`
+
+	// Composited output stream parameters (room -> SIP).
+	Width            int           `yaml:"width"`              // default 1280
+	Height           int           `yaml:"height"`             // default 720
+	FPS              int           `yaml:"fps"`                // default 30
+	BitrateKbps      int           `yaml:"bitrate_kbps"`       // default 2000
+	KeyFrameInterval time.Duration `yaml:"key_frame_interval"` // default 2s
+}
+
+const (
+	DefaultVideoWidth            = 1280
+	DefaultVideoHeight           = 720
+	DefaultVideoFPS              = 30
+	DefaultVideoBitrateKbps      = 2000
+	DefaultVideoKeyFrameInterval = 2 * time.Second
+)
+
+func (c *VideoConfig) init() {
+	if c.Width <= 0 {
+		c.Width = DefaultVideoWidth
+	}
+	if c.Height <= 0 {
+		c.Height = DefaultVideoHeight
+	}
+	if c.FPS <= 0 {
+		c.FPS = DefaultVideoFPS
+	}
+	if c.BitrateKbps <= 0 {
+		c.BitrateKbps = DefaultVideoBitrateKbps
+	}
+	if c.KeyFrameInterval <= 0 {
+		c.KeyFrameInterval = DefaultVideoKeyFrameInterval
+	}
+}
+
 type Config struct {
 	Redis     *redis.RedisConfig `yaml:"redis"`      // required
 	ApiKey    string             `yaml:"api_key"`    // required (env LIVEKIT_API_KEY)
@@ -127,6 +165,12 @@ type Config struct {
 	AudioDTMF              bool    `yaml:"audio_dtmf"`
 	EnableJitterBuffer     bool    `yaml:"enable_jitter_buffer"`
 	EnableJitterBufferProb float64 `yaml:"enable_jitter_buffer_prob"`
+
+	// Video enables bidirectional H.264 video over SIP. The room participants'
+	// video tiles are composited into a single grid tile and encoded for the
+	// SIP endpoint. Requires a binary built with the "gst" tag and GStreamer
+	// installed; otherwise the setting is ignored and calls remain audio-only.
+	Video VideoConfig `yaml:"video"`
 
 	// internal
 	ServiceName string `yaml:"-"`
@@ -185,6 +229,9 @@ func (c *Config) Init() error {
 	}
 	if c.MaxCpuUtilization <= 0 || c.MaxCpuUtilization > 1 {
 		c.MaxCpuUtilization = 0.9
+	}
+	if c.Video.Enabled {
+		c.Video.init()
 	}
 
 	if err := c.InitLogger(); err != nil {

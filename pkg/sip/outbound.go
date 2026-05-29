@@ -42,6 +42,7 @@ import (
 	"github.com/livekit/sipgo/sip"
 
 	"github.com/livekit/sip/pkg/config"
+	"github.com/livekit/sip/pkg/media/video"
 	"github.com/livekit/sip/pkg/stats"
 )
 
@@ -68,20 +69,21 @@ type sipOutboundConfig struct {
 }
 
 type outboundCall struct {
-	c         *Client
-	tid       traceid.ID
-	log       logger.Logger
-	state     *CallState
-	callStart time.Time
-	cc        *sipOutbound
-	media     *MediaPort
-	started   core.Fuse
-	stopped   core.Fuse
-	closing   core.Fuse
-	stats     Stats
-	sigTs     SignalingTimestamps
-	jitterBuf bool
-	projectID string
+	c            *Client
+	tid          traceid.ID
+	log          logger.Logger
+	state        *CallState
+	callStart    time.Time
+	cc           *sipOutbound
+	media        *MediaPort
+	started      core.Fuse
+	stopped      core.Fuse
+	closing      core.Fuse
+	stats        Stats
+	sigTs        SignalingTimestamps
+	jitterBuf    bool
+	projectID    string
+	videoEnabled bool
 
 	mu       sync.RWMutex
 	mon      *stats.CallMonitor
@@ -135,6 +137,7 @@ func (c *Client) newCall(ctx context.Context, tid traceid.ID, conf *config.Confi
 	call.mon = c.mon.NewCall(stats.Outbound, sipConf.host, sipConf.address)
 	var err error
 
+	videoEnabled := conf.Video.Enabled && video.Available()
 	call.media, err = NewMediaPort(tid, call.log, call.mon, &MediaOptions{
 		IP:                   c.sconf.MediaIP,
 		Ports:                conf.RTPPort,
@@ -147,6 +150,9 @@ func (c *Client) newCall(ctx context.Context, tid traceid.ID, conf *config.Confi
 		Stats:                &call.stats.Port,
 		NoInputResample:      !RoomResample,
 		IgnorePreanswerData:  true,
+		EnableVideo:          videoEnabled,
+		VideoFPS:             conf.Video.FPS,
+		VideoStats:           &call.stats.Video,
 	}, RoomSampleRate)
 	if err != nil {
 		call.close(ctx, errors.Wrap(err, "media failed"), callDropped, stats.ServerError("media-failed"), livekit.DisconnectReason_UNKNOWN_REASON)
@@ -485,6 +491,28 @@ func (c *outboundCall) connectMedia() {
 	c.media.HandleDTMF(c.handleDTMF)
 }
 
+// setupOutboundVideo configures the SIP video session, enables the room
+// compositor, routes its output to SIP and publishes the SIP caller's inbound
+// video into the room.
+func (c *outboundCall) setupOutboundVideo(v *videoMediaConf) error {
+	if err := c.media.SetVideoConfig(v); err != nil {
+		return err
+	}
+	cfg := videoConfigFrom(c.c.conf.Video)
+	if err := c.lkRoom.EnableVideo(cfg, &c.stats.Video); err != nil {
+		return err
+	}
+	c.lkRoom.SwapVideoOutput(c.media.GetVideoWriter())
+	vw, err := c.lkRoom.NewParticipantVideoTrack()
+	if err != nil {
+		return err
+	}
+	c.media.WriteVideoTo(vw.WriteSample)
+	c.videoEnabled = true
+	c.log.Infow("video negotiated", "remote", v.Remote.String(), "local_port", c.media.VideoPort())
+	return nil
+}
+
 type sipRespFunc func(code sip.StatusCode, hdrs Headers)
 
 func sipResponse(ctx context.Context, tx sip.ClientTransaction, stop <-chan struct{}, setState sipRespFunc) (*sip.Response, error) {
@@ -589,6 +617,9 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 	if err != nil {
 		return err
 	}
+	if c.media.VideoEnabled() {
+		addVideoOffer(&sdpOffer.SDP, c.media.VideoPort())
+	}
 	sdpOfferData, err := sdpOffer.SDP.Marshal()
 	if err != nil {
 		return err
@@ -659,8 +690,20 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 	mc.Processor = c.c.handler.GetMediaProcessor(c.sipConf.enabledFeatures, c.sipConf.featureFlags, string(c.cc.ID()), MediaProcessorOpts{InputSampleRate: c.media.InputSampleRate()})
 	c.cc.SetLocalSDP(localSDP)
 
+	// Set up video if both sides negotiated an H.264 m=video line.
+	if c.media.VideoEnabled() {
+		if v, ok := parseVideoOffer(sdpResp); ok {
+			if err := c.setupOutboundVideo(v); err != nil {
+				c.log.Warnw("video setup failed, continuing audio-only", err)
+			}
+		}
+	}
+
 	c.mon.InviteAccept()
 	c.media.EnableOut()
+	if c.videoEnabled {
+		c.media.EnableVideoOut()
+	}
 	c.media.EnableTimeout(true)
 	err = c.cc.AckInviteOK(ctx)
 	if err != nil {

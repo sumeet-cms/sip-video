@@ -31,6 +31,7 @@ import (
 
 	"github.com/frostbyte73/core"
 	"github.com/icholy/digest"
+	pionsdp "github.com/pion/sdp/v3"
 	"github.com/pkg/errors"
 
 	msdk "github.com/livekit/media-sdk"
@@ -48,6 +49,7 @@ import (
 	"github.com/livekit/sipgo/sip"
 
 	"github.com/livekit/sip/pkg/config"
+	"github.com/livekit/sip/pkg/media/video"
 	"github.com/livekit/sip/pkg/stats"
 	"github.com/livekit/sip/res"
 )
@@ -651,32 +653,33 @@ func (s *Server) onNotify(log *slog.Logger, req *sip.Request, tx sip.ServerTrans
 }
 
 type inboundCall struct {
-	s           *Server
-	tid         traceid.ID
-	logPtr      atomic.Pointer[logger.Logger]
-	cc          *sipInbound
-	mon         *stats.CallMonitor
-	state       *CallState
-	callStart   time.Time
-	extraAttrs  map[string]string
-	attrsToHdr  map[string]string
-	ctx         context.Context
-	cancel      func()
-	closeReason atomic.Pointer[ReasonHeader]
-	call        *rpc.SIPCall
-	mmu         sync.Mutex
-	media       *MediaPort
-	dtmf        chan dtmf.Event // buffered
-	lkRoom      RoomInterface   // LiveKit room; only active after correct pin is entered
-	callDur     func() time.Duration
-	joinDur     func() time.Duration
-	forwardDTMF atomic.Bool
-	done        atomic.Bool
-	started     core.Fuse
-	stats       Stats
-	sigTs       SignalingTimestamps
-	jitterBuf   bool
-	projectID   string
+	s            *Server
+	tid          traceid.ID
+	logPtr       atomic.Pointer[logger.Logger]
+	cc           *sipInbound
+	mon          *stats.CallMonitor
+	state        *CallState
+	callStart    time.Time
+	extraAttrs   map[string]string
+	attrsToHdr   map[string]string
+	ctx          context.Context
+	cancel       func()
+	closeReason  atomic.Pointer[ReasonHeader]
+	call         *rpc.SIPCall
+	mmu          sync.Mutex
+	media        *MediaPort
+	dtmf         chan dtmf.Event // buffered
+	lkRoom       RoomInterface   // LiveKit room; only active after correct pin is entered
+	callDur      func() time.Duration
+	joinDur      func() time.Duration
+	forwardDTMF  atomic.Bool
+	done         atomic.Bool
+	started      core.Fuse
+	stats        Stats
+	sigTs        SignalingTimestamps
+	jitterBuf    bool
+	projectID    string
+	videoEnabled bool
 }
 
 func (s *Server) newInboundCall(
@@ -920,6 +923,9 @@ func (c *inboundCall) handleInvite(ctx context.Context, tid traceid.ID, req *sip
 		}
 		c.media.EnableTimeout(true)
 		c.media.EnableOut()
+		if c.videoEnabled {
+			c.media.EnableVideoOut()
+		}
 		if ok, err := c.waitMedia(ctx); !ok {
 			return false, err
 		}
@@ -1055,6 +1061,7 @@ func (c *inboundCall) runMediaConn(tid traceid.ID, offerData []byte, mconf *sipM
 
 	logSignalChanges := false
 	logSignalChanges, _ = strconv.ParseBool(featureFlags[signalLoggingFeatureFlag])
+	videoEnabled := conf.Video.Enabled && video.Available()
 	mp, err := NewMediaPort(tid, c.log(), c.mon, &MediaOptions{
 		IP:                   c.s.sconf.MediaIP,
 		Ports:                conf.RTPPort,
@@ -1066,6 +1073,9 @@ func (c *inboundCall) runMediaConn(tid traceid.ID, offerData []byte, mconf *sipM
 		LogSignalChanges:     logSignalChanges,
 		Stats:                &c.stats.Port,
 		NoInputResample:      !RoomResample,
+		EnableVideo:          videoEnabled,
+		VideoFPS:             conf.Video.FPS,
+		VideoStats:           &c.stats.Video,
 	}, RoomSampleRate)
 	if err != nil {
 		return nil, err
@@ -1079,6 +1089,14 @@ func (c *inboundCall) runMediaConn(tid traceid.ID, offerData []byte, mconf *sipM
 	if err != nil {
 		return nil, err
 	}
+
+	// Negotiate an H.264 m=video line, if both sides support video.
+	if videoEnabled && mp.VideoEnabled() {
+		if err := c.setupVideo(offerData, &answer.SDP, mp, conf); err != nil {
+			c.log().Warnw("video negotiation failed, continuing audio-only", err)
+		}
+	}
+
 	answerData, err = answer.SDP.Marshal()
 	if err != nil {
 		return nil, err
@@ -1458,6 +1476,55 @@ func (c *inboundCall) publishTrack() error {
 		return err
 	}
 	c.media.WriteAudioTo(local)
+	if c.videoEnabled {
+		if err := c.publishVideoTrack(); err != nil {
+			// Video is best-effort; keep the audio call alive.
+			c.log().Warnw("cannot publish SIP video track", err)
+		}
+	}
+	return nil
+}
+
+func (c *inboundCall) publishVideoTrack() error {
+	vw, err := c.lkRoom.NewParticipantVideoTrack()
+	if err != nil {
+		return err
+	}
+	c.media.WriteVideoTo(vw.WriteSample)
+	return nil
+}
+
+// setupVideo negotiates an H.264 m=video answer when the remote offered video.
+// On success it configures the SIP video session, enables the room compositor
+// and appends the video answer to answerSDP. On any incompatibility it appends
+// a rejected (port 0) video answer and returns an error.
+func (c *inboundCall) setupVideo(offerData []byte, answerSDP *pionsdp.SessionDescription, mp *MediaPort, conf *config.Config) error {
+	var s pionsdp.SessionDescription
+	if err := s.Unmarshal(offerData); err != nil {
+		return err
+	}
+	offered := findVideoMedia(&s)
+	if offered == nil || offered.MediaName.Port.Value == 0 {
+		return nil // remote didn't offer active video
+	}
+	v, ok := parseVideoSession(&s)
+	if !ok {
+		rejectVideo(answerSDP, offered)
+		return fmt.Errorf("no compatible video codec offered")
+	}
+	if err := mp.SetVideoConfig(v); err != nil {
+		rejectVideo(answerSDP, offered)
+		return err
+	}
+	cfg := videoConfigFrom(conf.Video)
+	if err := c.lkRoom.EnableVideo(cfg, &c.stats.Video); err != nil {
+		rejectVideo(answerSDP, offered)
+		return err
+	}
+	c.lkRoom.SwapVideoOutput(mp.GetVideoWriter())
+	addVideoAnswer(answerSDP, mp.VideoPort(), v)
+	c.videoEnabled = true
+	c.log().Infow("video negotiated", "remote", v.Remote.String(), "local_port", mp.VideoPort())
 	return nil
 }
 

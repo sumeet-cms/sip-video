@@ -36,6 +36,7 @@ var _ json.Marshaler = (*Stats)(nil)
 type Stats struct {
 	Port   PortStats
 	Room   RoomStats
+	Video  VideoStats
 	Closed atomic.Bool
 }
 
@@ -43,6 +44,7 @@ type StatsSnapshot struct {
 	Port   PortStatsSnapshot  `json:"port"`
 	Room   RoomStatsSnapshot  `json:"room"`
 	Mixer  MixerStatsSnapshot `json:"mixer"`
+	Video  VideoStatsSnapshot `json:"video"`
 	Closed bool               `json:"closed"`
 }
 
@@ -109,6 +111,7 @@ func (s *Stats) Load() StatsSnapshot {
 			WriteErrors:         m.WriteErrors.Load(),
 			BlockedMixes:        m.BlockedMixes.Load(),
 		},
+		Video:  s.Video.Load(),
 		Closed: s.Closed.Load(),
 	}
 }

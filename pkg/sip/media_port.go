@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/frostbyte73/core"
+	"github.com/pion/webrtc/v4/pkg/media"
 
 	msdk "github.com/livekit/media-sdk"
 	"github.com/livekit/media-sdk/dtmf"
@@ -343,6 +344,15 @@ type MediaOptions struct {
 	NoInputResample      bool
 	IgnorePreanswerData  bool
 	LogSignalChanges     bool
+
+	// EnableVideo allocates a second RTP port for an H.264 m=video line.
+	EnableVideo bool
+	// VideoFPS is the expected output frame rate, used to size RTP timestamp
+	// increments when a sample carries no explicit duration.
+	VideoFPS int
+	// VideoStats, if set, receives video traffic counters. A new one is
+	// allocated when nil and EnableVideo is set.
+	VideoStats *VideoStats
 }
 
 func NewMediaPort(tid traceid.ID, log logger.Logger, mon *stats.CallMonitor, opts *MediaOptions, sampleRate int) (*MediaPort, error) {
@@ -388,6 +398,20 @@ func NewMediaPortWith(tid traceid.ID, log logger.Logger, mon *stats.CallMonitor,
 		audioOut:         msdk.NewSwitchWriter(sampleRate),
 		audioIn:          msdk.NewSwitchWriter(inSampleRate),
 		stats:            opts.Stats,
+	}
+	if opts.EnableVideo {
+		vc, err := rtp.ListenUDPPortRange(opts.Ports.Start, opts.Ports.End, netip.AddrFrom4([4]byte{0, 0, 0, 0}))
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		p.videoPort = newUDPConn(log, vc, opts.SymmetricRTP)
+		p.videoStats = opts.VideoStats
+		if p.videoStats == nil {
+			p.videoStats = &VideoStats{}
+		}
+		p.videoOut = &gatedVideoWriter{}
+		p.log.Debugw("listening for video on UDP", "port", p.VideoPort())
 	}
 	if p.opts.IgnorePreanswerData {
 		go p.port.discardLoop()
@@ -435,6 +459,16 @@ type MediaPort struct {
 	audioIn        *msdk.SwitchWriter // SIP RTP -> LK PCM
 	audioInHandler rtp.Handler        // for debug only
 	dtmfIn         atomic.Pointer[func(ev dtmf.Event)]
+
+	// Video (H.264) leg. Allocated only when MediaOptions.EnableVideo is set
+	// and negotiated via SetVideoConfig.
+	videoPort     *udpConn
+	videoSess     rtp.Session
+	videoConf     *videoMediaConf
+	videoOut      *gatedVideoWriter // LK H.264 sample -> SIP RTP
+	videoSink     *h264StreamIn     // SIP RTP -> LK H.264 sample
+	videoOnSample atomic.Pointer[func(media.Sample) error]
+	videoStats    *VideoStats
 }
 
 func (p *MediaPort) DisableOut() {
@@ -618,6 +652,16 @@ func (p *MediaPort) Close() {
 		}
 		_ = p.port.Close()
 
+		if p.videoOut != nil {
+			p.videoOut.Disable()
+		}
+		if p.videoSess != nil {
+			_ = p.videoSess.Close()
+		}
+		if p.videoPort != nil {
+			_ = p.videoPort.Close()
+		}
+
 		hnd := p.hnd.Load()
 		if hnd != nil {
 			(*hnd).Close()
@@ -662,6 +706,144 @@ func (p *MediaPort) WriteAudioTo(w msdk.PCM16Writer) {
 // GetAudioWriter returns audio writer that will send PCM to the destination via RTP.
 func (p *MediaPort) GetAudioWriter() msdk.PCM16Writer {
 	return p.audioOut
+}
+
+// VideoEnabled reports whether a video RTP port was allocated for this port.
+func (p *MediaPort) VideoEnabled() bool {
+	return p != nil && p.videoPort != nil
+}
+
+// VideoPort returns the local UDP port used for video RTP, or 0 if video is
+// not enabled.
+func (p *MediaPort) VideoPort() int {
+	if p.videoPort == nil {
+		return 0
+	}
+	return p.videoPort.LocalAddr().(*net.UDPAddr).Port
+}
+
+// VideoStats returns the video statistics for this port, or nil if video is
+// not enabled.
+func (p *MediaPort) VideoStats() *VideoStats {
+	return p.videoStats
+}
+
+// VideoConfig returns the negotiated video configuration, or nil.
+func (p *MediaPort) VideoConfig() *videoMediaConf {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.videoConf
+}
+
+func (p *MediaPort) DisableVideoOut() {
+	if p.videoOut != nil {
+		p.videoOut.Disable()
+	}
+}
+
+func (p *MediaPort) EnableVideoOut() {
+	if p.videoOut != nil {
+		p.videoOut.Enable()
+	}
+}
+
+// GetVideoWriter returns the writer that packetizes encoded H.264 access units
+// and sends them to the SIP endpoint via RTP. Returns nil if video is disabled.
+func (p *MediaPort) GetVideoWriter() videoSampleWriter {
+	if p.videoOut == nil {
+		return nil
+	}
+	return p.videoOut
+}
+
+// WriteVideoTo registers a callback that receives decoded H.264 access units
+// from the SIP endpoint (for publishing into the LiveKit room).
+func (p *MediaPort) WriteVideoTo(onSample func(media.Sample) error) {
+	if p.videoPort == nil {
+		return
+	}
+	p.videoOnSample.Store(&onSample)
+}
+
+// SetVideoConfig applies the negotiated video parameters: it creates the video
+// RTP session, the outbound packetizer and the inbound depacketizer, and starts
+// reading video RTP. It is a no-op if video was not enabled on this port.
+func (p *MediaPort) SetVideoConfig(v *videoMediaConf) error {
+	if p.videoPort == nil || v == nil {
+		return nil
+	}
+	if p.closed.IsBroken() {
+		return errors.New("media is already closed")
+	}
+	p.log.Infow("using video codec", "video-rtp", v.Type, "profile", v.ProfileLevelID,
+		"packetization-mode", v.PacketizationMode, "remote", v.Remote.String())
+
+	p.videoPort.SetDst(v.Remote)
+	if p.opts.IgnoreLocalAddrInSDP && v.Remote.Addr().IsPrivate() {
+		p.videoPort.SetSymmetric(true)
+	}
+	sess := rtp.NewSession(p.log, p.videoPort)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.videoConf = v
+	p.videoSess = sess
+
+	// Outbound: encoded H.264 -> RTP.
+	w, err := sess.OpenWriteStream()
+	if err != nil {
+		return err
+	}
+	fps := p.opts.VideoFPS
+	out := newH264RTPWriter(w, v.Type, v.ClockRate, fps, p.videoStats)
+	p.videoOut.Swap(out)
+
+	// Inbound: RTP -> H.264 access units -> registered callback.
+	p.videoSink = newH264StreamIn(v.ClockRate, func(s media.Sample) {
+		if cb := p.videoOnSample.Load(); cb != nil && *cb != nil {
+			_ = (*cb)(s)
+		}
+	}, p.videoStats)
+	go p.videoRTPLoop(sess, p.videoSink)
+	return nil
+}
+
+func (p *MediaPort) videoRTPLoop(sess rtp.Session, sink *h264StreamIn) {
+	for {
+		r, ssrc, err := sess.AcceptStream()
+		if err != nil {
+			if !errors.Is(err, net.ErrClosed) && !strings.Contains(err.Error(), "closed") {
+				p.log.Errorw("cannot accept video RTP stream", err)
+			}
+			return
+		}
+		p.mediaReceived.Break()
+		log := p.log.WithValues("ssrc", ssrc, "media", "video")
+		log.Infow("accepting video RTP stream")
+		go p.videoReadStream(log, r, sink)
+	}
+}
+
+func (p *MediaPort) videoReadStream(log logger.Logger, r rtp.ReadStream, sink *h264StreamIn) {
+	buf := make([]byte, rtp.MTUSize+1)
+	var h rtp.Header
+	for {
+		h = rtp.Header{}
+		n, err := r.ReadRTP(&h, buf)
+		if err == io.EOF {
+			return
+		} else if err != nil {
+			log.Debugw("read video RTP failed", "error", err)
+			return
+		}
+		p.lastPacketTime.Store(time.Now().UnixNano())
+		if n > rtp.MTUSize {
+			continue
+		}
+		if err := sink.HandleRTP(&h, buf[:n]); err != nil {
+			log.Debugw("handle video RTP failed", "error", err)
+		}
+	}
 }
 
 // NewOffer generates an SDP offer for the media.

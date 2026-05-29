@@ -33,6 +33,12 @@ require (
 )
 
 require (
+	github.com/go-gst/go-glib v1.4.0 // indirect
+	github.com/go-gst/go-gst v1.4.0
+	github.com/mattn/go-pointer v0.0.1 // indirect
+)
+
+require (
 	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.11-20260209202127-80ab13bee0bf.1 // indirect
 	buf.build/go/protovalidate v1.1.2 // indirect
 	buf.build/go/protoyaml v0.6.0 // indirect

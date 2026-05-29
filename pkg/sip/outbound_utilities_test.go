@@ -38,6 +38,7 @@ import (
 	"github.com/livekit/media-sdk/rtp"
 	lksdk "github.com/livekit/server-sdk-go/v2"
 	"github.com/livekit/sip/pkg/config"
+	"github.com/livekit/sip/pkg/media/video"
 	"github.com/livekit/sip/pkg/stats"
 )
 
@@ -267,6 +268,22 @@ func (r *testRoom) NewTrack() *mixer.Input {
 
 func (r *testRoom) RegisterRPC(method string, handler lksdk.RpcHandlerFunc) error {
 	return r.room.RegisterRPC(method, handler)
+}
+
+func (r *testRoom) VideoEnabled() bool {
+	return false
+}
+
+func (r *testRoom) EnableVideo(cfg video.Config, stats *VideoStats) error {
+	return video.ErrNotSupported
+}
+
+func (r *testRoom) SwapVideoOutput(w videoSampleWriter) videoSampleWriter {
+	return nil
+}
+
+func (r *testRoom) NewParticipantVideoTrack() (VideoTrackWriter, error) {
+	return nil, video.ErrNotSupported
 }
 
 type testSIPClientTransaction struct {
