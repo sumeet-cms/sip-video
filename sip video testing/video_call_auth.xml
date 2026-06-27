@@ -1,0 +1,179 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Same as video_call.xml, but for trunks that require SIP digest auth.
+
+  Flow: INVITE (CSeq 1) -> 401/407 -> ACK (CSeq 1) ->
+        INVITE+Authorization (CSeq 2) -> 200 -> ACK (CSeq 2) ->
+        publish video + audio, wait 10s, DTMF 560545#, record window, BYE (CSeq 3).
+
+  Pass credentials on the command line:
+      -au <username> -ap <password>
+  (optionally -auth_uri <realm/uri> if the server is picky).
+
+  See video_call.xml for the payload-type / media notes.
+-->
+
+<scenario name="Video call + DTMF meeting join (digest auth)">
+
+  <!-- First INVITE (unauthenticated) -->
+  <send retrans="500">
+    <![CDATA[
+
+      INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "sipp-video" <sip:[service]@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[service]@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:sipp@[local_ip]:[local_port];transport=[transport]>
+      Max-Forwards: 70
+      Allow: INVITE, ACK, CANCEL, BYE, INFO, OPTIONS, NOTIFY, REFER
+      User-Agent: SIPp-Video-Test
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=sipp [call_number] [call_number] IN IP[local_ip_type] [media_ip]
+      s=SIPp-Video-Test
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [auto_media_port] RTP/AVP 0 96
+      a=rtpmap:0 PCMU/8000
+      a=rtpmap:96 telephone-event/8000
+      a=fmtp:96 0-15
+      a=sendrecv
+      m=video [auto_media_port+2] RTP/AVP 97
+      a=rtpmap:97 H264/90000
+      a=fmtp:97 profile-level-id=42e01f;packetization-mode=1;level-asymmetry-allowed=1
+      a=rtcp-fb:97 nack pli
+      a=sendrecv
+
+    ]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <!-- Expect a challenge. auth="true" stores the challenge for [authentication]. -->
+  <recv response="407" auth="true" optional="true" />
+  <recv response="401" auth="true" optional="true" />
+
+  <!-- ACK the challenge response (same CSeq as the first INVITE). -->
+  <send>
+    <![CDATA[
+
+      ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "sipp-video" <sip:[service]@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Re-send the INVITE with credentials (CSeq 2). -->
+  <send retrans="500">
+    <![CDATA[
+
+      INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "sipp-video" <sip:[service]@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[service]@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 2 INVITE
+      Contact: <sip:sipp@[local_ip]:[local_port];transport=[transport]>
+      [authentication]
+      Max-Forwards: 70
+      Allow: INVITE, ACK, CANCEL, BYE, INFO, OPTIONS, NOTIFY, REFER
+      User-Agent: SIPp-Video-Test
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=sipp [call_number] [call_number] IN IP[local_ip_type] [media_ip]
+      s=SIPp-Video-Test
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [auto_media_port] RTP/AVP 0 96
+      a=rtpmap:0 PCMU/8000
+      a=rtpmap:96 telephone-event/8000
+      a=fmtp:96 0-15
+      a=sendrecv
+      m=video [auto_media_port+2] RTP/AVP 97
+      a=rtpmap:97 H264/90000
+      a=fmtp:97 profile-level-id=42e01f;packetization-mode=1;level-asymmetry-allowed=1
+      a=rtcp-fb:97 nack pli
+      a=sendrecv
+
+    ]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="180" optional="true" />
+  <recv response="183" optional="true" />
+  <recv response="200" rtd="true" rrs="true" />
+
+  <send>
+    <![CDATA[
+
+      ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "sipp-video" <sip:[service]@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 2 ACK
+      Contact: <sip:sipp@[local_ip]:[local_port];transport=[transport]>
+      Max-Forwards: 70
+      User-Agent: SIPp-Video-Test
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <nop>
+    <action>
+      <exec play_pcap_video="media/video.pcap" />
+    </action>
+  </nop>
+
+  <nop>
+    <action>
+      <exec play_pcap_audio="media/audio.pcap" />
+    </action>
+  </nop>
+
+  <pause milliseconds="10000" />
+
+  <nop>
+    <action>
+      <exec play_dtmf="560545#" />
+    </action>
+  </nop>
+
+  <pause milliseconds="4000" />
+  <pause milliseconds="45000" />
+
+  <send retrans="500">
+    <![CDATA[
+
+      BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: "sipp-video" <sip:[service]@[local_ip]:[local_port]>;tag=[call_number]
+      To: <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 3 BYE
+      Contact: <sip:sipp@[local_ip]:[local_port];transport=[transport]>
+      Max-Forwards: 70
+      User-Agent: SIPp-Video-Test
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200" crlf="true" />
+
+</scenario>

@@ -87,9 +87,11 @@ func (r *Room) handleVideoTrack(log logger.Logger, track *webrtc.TrackRemote, pu
 	r.videoMu.Lock()
 	comp := r.comp
 	r.videoMu.Unlock()
+	log.Infow("GOT HERE handleVideoTrack", "comp", comp)
 	if comp == nil {
 		return
 	}
+	log.Infow("GOT HERE handleVideoTrack 11111", "comp", comp)
 
 	codec := video.CodecFromMimeType(track.Codec().MimeType)
 	if codec == video.CodecUnknown {
