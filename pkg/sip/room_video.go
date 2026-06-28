@@ -109,7 +109,13 @@ func (r *Room) handleVideoTrack(log logger.Logger, track *webrtc.TrackRemote, pu
 		return
 	}
 	id := pub.SID()
-	in, err := comp.AddInput(id, codec, int(track.Codec().ClockRate), int(track.Codec().PayloadType))
+	// Use the participant's display name for the on-screen label; fall back to
+	// identity (unique string) if the name hasn't been set.
+	label := rp.Name()
+	if label == "" {
+		label = rp.Identity()
+	}
+	in, err := comp.AddInput(id, codec, int(track.Codec().ClockRate), int(track.Codec().PayloadType), label)
 	if err != nil {
 		log.Errorw("cannot add compositor input", err)
 		return

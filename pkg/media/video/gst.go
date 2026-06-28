@@ -66,6 +66,17 @@ func NewCompositor(log logger.Logger, cfg Config, onSample func(Sample)) (Compos
 	if err != nil {
 		return nil, err
 	}
+	// videorate sits between the compositor and the caps filter so that:
+	//  1. The output frame rate is *exactly* cfg.FPS regardless of how fast the
+	//     compositor's aggregator fires (with 2 live inputs it may fire at 2× rate).
+	//  2. Every buffer that reaches x264enc has a valid Duration field equal to
+	//     1/FPS seconds — without this the H.264 RTP writer falls back to the
+	//     configured fps guess, but if that guess is wrong the recorded video will
+	//     be sped-up or slowed-down (we observed a 44 s call producing 22 s video).
+	vrate, err := gst.NewElement("videorate")
+	if err != nil {
+		return nil, err
+	}
 	rawCaps, err := gst.NewElement("capsfilter")
 	if err != nil {
 		return nil, err
@@ -143,10 +154,10 @@ func NewCompositor(log logger.Logger, cfg Config, onSample func(Sample)) (Compos
 		},
 	})
 
-	if err := pipeline.AddMany(comp, convert, rawCaps, enc, encCaps, sink.Element); err != nil {
+	if err := pipeline.AddMany(comp, convert, vrate, rawCaps, enc, encCaps, sink.Element); err != nil {
 		return nil, err
 	}
-	if err := gst.ElementLinkMany(comp, convert, rawCaps, enc, encCaps, sink.Element); err != nil {
+	if err := gst.ElementLinkMany(comp, convert, vrate, rawCaps, enc, encCaps, sink.Element); err != nil {
 		return nil, err
 	}
 	if err := pipeline.SetState(gst.StatePlaying); err != nil {
@@ -196,7 +207,7 @@ func depayDecodeFor(codec InputCodec) (depay, decoder string, err error) {
 	}
 }
 
-func (c *gstCompositor) AddInput(id string, codec InputCodec, clockRate int, payloadType int) (Input, error) {
+func (c *gstCompositor) AddInput(id string, codec InputCodec, clockRate int, payloadType int, label string) (Input, error) {
 	depayName, decName, err := depayDecodeFor(codec)
 	if err != nil {
 		return nil, err
@@ -252,27 +263,48 @@ func (c *gstCompositor) AddInput(id string, codec InputCodec, clockRate int, pay
 		_ = dec.SetProperty("post-processing", false)
 		_ = dec.SetProperty("deblock", false)
 	}
+	// Respect any video-orientation metadata sent by the WebRTC publisher (e.g.
+	// a mobile device held in portrait mode). method=8 is "automatic" — reads
+	// the GstVideoOrientationInterface tags set by rtpvp8depay from the RTP
+	// video-orientation header extension and rotates/flips accordingly.
+	flip, _ := gst.NewElement("videoflip")
+	_ = flip.SetProperty("method", 8)
 	conv, _ := gst.NewElement("videoconvert")
 	scale, _ := gst.NewElement("videoscale")
 	// Preserve aspect ratio by letterboxing / pillarboxing with black borders
 	// instead of stretching the source image to fill the tile dimensions.
 	_ = scale.SetProperty("add-borders", true)
+	scaleCaps, _ := gst.NewElement("capsfilter")
+
+	// Optional name label rendered at the bottom of each tile.
+	elems := []*gst.Element{src.Element, jitter, depay, dec, flip, conv, scale, scaleCaps}
+	if label != "" {
+		overlay, _ := gst.NewElement("textoverlay")
+		_ = overlay.SetProperty("text", label)
+		_ = overlay.SetProperty("valignment", 1)    // bottom
+		_ = overlay.SetProperty("halignment", 1)    // center
+		_ = overlay.SetProperty("font-desc", "Sans Bold 14")
+		_ = overlay.SetProperty("color", uint(0xFFFFFFFF))        // white text
+		_ = overlay.SetProperty("outline-color", uint(0xFF000000)) // black outline
+		_ = overlay.SetProperty("shading-value", 0.4)
+		elems = append(elems, overlay)
+	}
+
 	queue, _ := gst.NewElement("queue")
 	// Allow a small buffer before the compositor pad. When the compositor is
 	// momentarily slower than the input, this absorbs short bursts; upstream
-	// leaky ensures the oldest (most stale) frame is dropped rather than
-	// blocking the decoder goroutine.
+	// leaky ensures a new arrival is dropped rather than blocking the decoder.
 	_ = queue.SetProperty("max-size-buffers", uint(4))
 	_ = queue.SetProperty("max-size-time", uint64(0))
 	_ = queue.SetProperty("max-size-bytes", uint(0))
-	_ = queue.SetProperty("leaky", 1) // upstream: drop newest arrival, keep existing frames
-	scaleCaps, _ := gst.NewElement("capsfilter")
+	_ = queue.SetProperty("leaky", 1) // upstream
+	elems = append(elems, queue)
 
 	in := &gstInput{
 		id:     id,
 		comp:   c,
 		src:    src,
-		elems:  []*gst.Element{src.Element, jitter, depay, dec, conv, scale, scaleCaps, queue},
+		elems:  elems,
 		scaler: scaleCaps,
 	}
 
