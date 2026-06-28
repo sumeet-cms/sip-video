@@ -168,6 +168,11 @@ def main():
                     help="output basename (writes <out>.h264 and <out>.mp4)")
     ap.add_argument("--direction", choices=["in", "out", "both"], default="in",
                     help="in = packets arriving at our port (received video)")
+    ap.add_argument("--fps", type=float, default=0,
+                    help="override playback fps for the muxed mp4 "
+                         "(default: auto-detect from RTP timestamps)")
+    ap.add_argument("--rtp-clock-rate", type=int, default=90000,
+                    help="RTP clock rate for the video stream (default: 90000)")
     args = ap.parse_args()
 
     if not os.path.exists(args.pcap):
@@ -195,7 +200,8 @@ def main():
             continue
         seq, ts, pt, body = rtp
         ssrc = struct.unpack("!I", payload[8:12])[0]
-        by_ssrc.setdefault(ssrc, []).append((seq, body))
+        # Store (seq, rtp_timestamp, payload_body) so we can derive real fps.
+        by_ssrc.setdefault(ssrc, []).append((seq, ts, body))
         total += 1
 
     if not by_ssrc:
@@ -213,9 +219,44 @@ def main():
 
     # Reorder by sequence number relative to the first packet, unwrapping the
     # 16-bit wrap so a stream that crosses 65535->0 stays in order.
-    base = pkts[0][0]
-    ordered = sorted(pkts, key=lambda p: ((p[0] - base) & 0xFFFF))
-    annexb = depacketize_h264(ordered)
+    base_seq = pkts[0][0]
+    ordered = sorted(pkts, key=lambda p: ((p[0] - base_seq) & 0xFFFF))
+
+    # Derive the real frame rate from RTP timestamps.
+    # H.264 RTP clock is 90 000 Hz.  We count how many unique timestamps appear
+    # (= frames) and how many clock ticks they span, then compute fps.
+    detected_fps = 15.0  # safe fallback
+    unique_ts = sorted({p[1] for p in ordered})
+    if args.fps > 0:
+        detected_fps = args.fps
+        print(f"Using user-supplied fps: {detected_fps:.3f}")
+    elif len(unique_ts) >= 2:
+        # Unwrap 32-bit RTP timestamp rollover.
+        ts_span = (unique_ts[-1] - unique_ts[0]) & 0xFFFFFFFF
+        num_frames = len(unique_ts)
+        if ts_span > 0:
+            # Average ticks per frame → fps.
+            ticks_per_frame = ts_span / (num_frames - 1)
+            detected_fps = args.rtp_clock_rate / ticks_per_frame
+            duration_s = ts_span / args.rtp_clock_rate
+            print(f"RTP timestamps: first={unique_ts[0]}, last={unique_ts[-1]}, "
+                  f"span={ts_span} ticks ({duration_s:.1f} s), "
+                  f"unique frames={num_frames}, "
+                  f"detected fps={detected_fps:.2f}")
+        else:
+            print("WARNING: all packets have the same RTP timestamp; "
+                  f"falling back to fps={detected_fps}")
+    else:
+        print(f"WARNING: too few unique timestamps to detect fps; "
+              f"falling back to {detected_fps}")
+
+    # Round fps to a sensible value (e.g. 14.97 → 15).
+    rounded_fps = round(detected_fps)
+    if abs(detected_fps - rounded_fps) / max(detected_fps, 1) < 0.05:
+        detected_fps = float(rounded_fps)
+    fps_str = f"{detected_fps:.3f}".rstrip("0").rstrip(".")
+
+    annexb = depacketize_h264([(p[0], p[2]) for p in ordered])
 
     h264_path = args.out + ".h264"
     with open(h264_path, "wb") as f:
@@ -225,20 +266,23 @@ def main():
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg:
         mp4_path = args.out + ".mp4"
+        # Use the detected fps so the mp4 plays at real-time speed regardless
+        # of the configured server frame rate.  -fflags +genpts regenerates PTS
+        # from DTS (needed when the Annex-B stream lacks timing info).
         cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "warning",
-               "-fflags", "+genpts", "-r", "30", "-i", h264_path,
+               "-fflags", "+genpts", "-r", fps_str, "-i", h264_path,
                "-c", "copy", mp4_path]
-        print("Muxing to mp4:", " ".join(cmd))
+        print(f"Muxing to mp4 at {fps_str} fps:", " ".join(cmd))
         rc = subprocess.run(cmd).returncode
         if rc == 0:
             print(f"Wrote {mp4_path}")
         else:
             print("ffmpeg mux failed; the raw .h264 is still usable "
-                  "(try: ffmpeg -framerate 30 -i %s out.mp4)" % h264_path,
+                  f"(try: ffmpeg -framerate {fps_str} -i {h264_path} {args.out}.mp4)",
                   file=sys.stderr)
     else:
         print("ffmpeg not found; play the raw stream with:\n"
-              f"  ffmpeg -framerate 30 -i {h264_path} {args.out}.mp4")
+              f"  ffmpeg -framerate {fps_str} -i {h264_path} {args.out}.mp4")
     return 0
 
 

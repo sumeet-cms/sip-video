@@ -115,7 +115,13 @@ func (r *Room) handleVideoTrack(log logger.Logger, track *webrtc.TrackRemote, pu
 	if label == "" {
 		label = rp.Identity()
 	}
-	in, err := comp.AddInput(id, codec, int(track.Codec().ClockRate), int(track.Codec().PayloadType), label)
+	// Determine kind so the compositor can apply the right layout zone.
+	kind := video.KindCamera
+	if pub.Source() == livekit.TrackSource_SCREEN_SHARE {
+		kind = video.KindScreenShare
+		label += " (Screen)"
+	}
+	in, err := comp.AddInput(id, codec, int(track.Codec().ClockRate), int(track.Codec().PayloadType), label, kind)
 	if err != nil {
 		log.Errorw("cannot add compositor input", err)
 		return

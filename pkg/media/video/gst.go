@@ -23,6 +23,7 @@ package video
 import (
 	"fmt"
 	"math"
+	"sort"
 	"sync"
 	"time"
 
@@ -207,7 +208,7 @@ func depayDecodeFor(codec InputCodec) (depay, decoder string, err error) {
 	}
 }
 
-func (c *gstCompositor) AddInput(id string, codec InputCodec, clockRate int, payloadType int, label string) (Input, error) {
+func (c *gstCompositor) AddInput(id string, codec InputCodec, clockRate int, payloadType int, label string, kind InputKind) (Input, error) {
 	depayName, decName, err := depayDecodeFor(codec)
 	if err != nil {
 		return nil, err
@@ -302,6 +303,7 @@ func (c *gstCompositor) AddInput(id string, codec InputCodec, clockRate int, pay
 
 	in := &gstInput{
 		id:     id,
+		kind:   kind,
 		comp:   c,
 		src:    src,
 		elems:  elems,
@@ -376,34 +378,109 @@ func (c *gstCompositor) ForceKeyFrame() {
 	}
 }
 
-// relayoutLocked recomputes the grid coordinates of every tile so that all
-// inputs are arranged into the smallest square-ish grid that fits them.
+// relayoutLocked recomputes tile positions and sizes for every input.
+//
+// Layout rules (canvas W×H, e.g. 1280×720)
+// -----------------------------------------
+//
+//  Camera-only (or screen-only):
+//    Inputs fill the full canvas in the smallest square-ish grid.
+//    Each cell is W/cols × H/rows, fully covering the canvas.
+//    videoscale(add-borders=true) letterboxes/pillarboxes source content
+//    inside each cell so nothing is ever cropped.
+//
+//    Examples for 1280×720:
+//      1 input  → 1×1 → cell 1280×720  (full canvas)
+//      2 inputs → 2×1 → cell  640×720  (source 16:9 letterboxed, 180 px bars)
+//      4 inputs → 2×2 → cell  640×360  (source 16:9, perfect fill)
+//
+//  Mixed (screens + cameras):
+//    ┌──────────────────┬──────────┐
+//    │  screen-share(s) │ camera 1 │
+//    │    main area     │ camera 2 │
+//    │  (3/4 of width)  │   ...    │
+//    └──────────────────┴──────────┘
+//    Screen-shares fill the left 3/4 of the canvas; cameras stack in the
+//    remaining 1/4 strip on the right.  This matches the standard
+//    "presentation mode" found in video-conferencing apps.
+//
+// Inputs are sorted by ID before placement so the tile order is deterministic
+// across relayout calls (participants join/leave do not shuffle existing tiles).
 func (c *gstCompositor) relayoutLocked() {
-	n := len(c.inputs)
+	if len(c.inputs) == 0 {
+		return
+	}
+
+	// Sort inputs by ID for stable, deterministic tile order.
+	all := make([]*gstInput, 0, len(c.inputs))
+	for _, in := range c.inputs {
+		all = append(all, in)
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].id < all[j].id })
+
+	var cameras, screens []*gstInput
+	for _, in := range all {
+		if in.kind == KindScreenShare {
+			screens = append(screens, in)
+		} else {
+			cameras = append(cameras, in)
+		}
+	}
+
+	W, H := c.cfg.Width, c.cfg.Height
+
+	if len(screens) == 0 || len(cameras) == 0 {
+		// Only one kind present: fill the entire canvas.
+		inputs := cameras
+		if len(screens) > 0 {
+			inputs = screens
+		}
+		c.layoutGrid(inputs, 0, 0, W, H)
+	} else {
+		// Mixed: screenshare(s) on the left (3/4 width), cameras on the right (1/4 width).
+		mainW := W * 3 / 4
+		stripW := W - mainW
+		c.layoutGrid(screens, 0, 0, mainW, H)
+		c.layoutGrid(cameras, mainW, 0, stripW, H)
+	}
+}
+
+// layoutGrid places len(inputs) tiles into the rectangle (xOff, yOff, w, h)
+// using the smallest square-ish grid.  Each cell is w/cols × h/rows pixels;
+// videoscale's add-borders property ensures source content is never cropped.
+func (c *gstCompositor) layoutGrid(inputs []*gstInput, xOff, yOff, w, h int) {
+	n := len(inputs)
 	if n == 0 {
 		return
 	}
 	cols := int(math.Ceil(math.Sqrt(float64(n))))
 	rows := int(math.Ceil(float64(n) / float64(cols)))
-	tileW := c.cfg.Width / cols
-	tileH := c.cfg.Height / rows
+	tileW := w / cols
+	tileH := h / rows
 
-	i := 0
-	for _, in := range c.inputs {
+	c.log.Infow("§ layout grid",
+		"n", n, "xOff", xOff, "yOff", yOff,
+		"areaW", w, "areaH", h,
+		"cols", cols, "rows", rows,
+		"tileW", tileW, "tileH", tileH,
+	)
+
+	for i, in := range inputs {
 		col := i % cols
 		row := i / cols
+		xpos := xOff + col*tileW
+		ypos := yOff + row*tileH
 		if in.scaler != nil {
 			_ = in.scaler.SetProperty("caps", gst.NewCapsFromString(
 				fmt.Sprintf("video/x-raw,width=%d,height=%d", tileW, tileH),
 			))
 		}
 		if in.compPad != nil {
-			_ = in.compPad.SetProperty("xpos", col*tileW)
-			_ = in.compPad.SetProperty("ypos", row*tileH)
+			_ = in.compPad.SetProperty("xpos", xpos)
+			_ = in.compPad.SetProperty("ypos", ypos)
 			_ = in.compPad.SetProperty("width", tileW)
 			_ = in.compPad.SetProperty("height", tileH)
 		}
-		i++
 	}
 }
 
@@ -467,6 +544,7 @@ func (c *gstCompositor) watchBus() {
 
 type gstInput struct {
 	id      string
+	kind    InputKind
 	comp    *gstCompositor
 	src     *app.Source
 	elems   []*gst.Element

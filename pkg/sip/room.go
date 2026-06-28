@@ -330,11 +330,22 @@ func (r *Room) subscribeTo(pub *lksdk.RemoteTrackPublication, rp *lksdk.RemotePa
 			log.Debugw("skipping video track - video disabled")
 			return
 		}
-		log.Debugw("subscribing to a video track")
-		// Prefer the low simulcast layer: each participant is rendered as a small
-		// grid tile, so full-resolution decode is wasted CPU (2× VP8 decode +
-		// compositor + x264 encode easily exceeds 150% on a single call).
-		_ = pub.SetVideoQuality(livekit.VideoQuality_LOW)
+		log.Debugw("subscribing to a video track", "source", pub.Source())
+		// Use different simulcast layers depending on track source:
+		//  • Camera       → LOW  (~160×90, 7.5 fps): each camera tile is small in
+		//                   the composite grid; the lower resolution saves decode
+		//                   CPU and videorate on the output fills any frame-rate gap.
+		//  • Screen share → MEDIUM (~half res): screenshare content has fine text
+		//                   and UI detail that becomes unreadable at quarter resolution,
+		//                   so we accept the higher bitrate/CPU for legibility.
+		//                   Screenshare also typically lacks a LOW simulcast layer,
+		//                   so requesting LOW would silently fall back to full anyway.
+		switch pub.Source() {
+		case livekit.TrackSource_SCREEN_SHARE:
+			_ = pub.SetVideoQuality(livekit.VideoQuality_MEDIUM)
+		default:
+			_ = pub.SetVideoQuality(livekit.VideoQuality_LOW)
+		}
 		if err := pub.SetSubscribed(true); err != nil {
 			log.Errorw("cannot subscribe to the video track", err)
 			return

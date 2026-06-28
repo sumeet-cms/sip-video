@@ -45,6 +45,15 @@ const (
 	DefaultKeyFrameInterval = 2 * time.Second
 )
 
+// InputKind distinguishes camera tracks from screen-share tracks so the
+// compositor can apply different layout strategies.
+type InputKind int
+
+const (
+	KindCamera      InputKind = iota // regular webcam / camera
+	KindScreenShare                  // screen-share track
+)
+
 // InputCodec identifies the codec of an incoming participant video track.
 type InputCodec int
 
@@ -137,8 +146,9 @@ type Compositor interface {
 	// lifetime of the compositor. clockRate is the RTP clock rate of the input
 	// track (typically 90000 for video). payloadType is the negotiated RTP
 	// dynamic payload type for the codec on this track. label is the display
-	// name rendered below the tile; pass "" to suppress the name overlay.
-	AddInput(id string, codec InputCodec, clockRate int, payloadType int, label string) (Input, error)
+	// name rendered below the tile (pass "" to suppress). kind controls layout
+	// placement: cameras go into the grid area, screen-shares into the main area.
+	AddInput(id string, codec InputCodec, clockRate int, payloadType int, label string, kind InputKind) (Input, error)
 	// RemoveInput removes a participant tile by id. It is safe to call with an
 	// unknown id.
 	RemoveInput(id string)
