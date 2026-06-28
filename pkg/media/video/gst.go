@@ -253,29 +253,26 @@ func (c *gstCompositor) AddInput(id string, codec InputCodec, clockRate int, pay
 		_ = dec.SetProperty("deblock", false)
 	}
 	conv, _ := gst.NewElement("videoconvert")
-	rate, _ := gst.NewElement("videorate")
-	rateCaps, _ := gst.NewElement("capsfilter")
-	_ = rateCaps.SetProperty("caps", gst.NewCapsFromString(
-		fmt.Sprintf("video/x-raw,framerate=%d/1", c.cfg.FPS),
-	))
 	scale, _ := gst.NewElement("videoscale")
 	// Preserve aspect ratio by letterboxing / pillarboxing with black borders
 	// instead of stretching the source image to fill the tile dimensions.
 	_ = scale.SetProperty("add-borders", true)
 	queue, _ := gst.NewElement("queue")
-	// Drop stale frames instead of letting the queue grow — keeps latency and
-	// CPU bounded when the compositor momentarily falls behind.
-	_ = queue.SetProperty("max-size-buffers", uint(2))
+	// Allow a small buffer before the compositor pad. When the compositor is
+	// momentarily slower than the input, this absorbs short bursts; upstream
+	// leaky ensures the oldest (most stale) frame is dropped rather than
+	// blocking the decoder goroutine.
+	_ = queue.SetProperty("max-size-buffers", uint(4))
 	_ = queue.SetProperty("max-size-time", uint64(0))
 	_ = queue.SetProperty("max-size-bytes", uint(0))
-	_ = queue.SetProperty("leaky", 2) // downstream
+	_ = queue.SetProperty("leaky", 1) // upstream: drop newest arrival, keep existing frames
 	scaleCaps, _ := gst.NewElement("capsfilter")
 
 	in := &gstInput{
 		id:     id,
 		comp:   c,
 		src:    src,
-		elems:  []*gst.Element{src.Element, jitter, depay, dec, conv, rate, rateCaps, scale, scaleCaps, queue},
+		elems:  []*gst.Element{src.Element, jitter, depay, dec, conv, scale, scaleCaps, queue},
 		scaler: scaleCaps,
 	}
 
