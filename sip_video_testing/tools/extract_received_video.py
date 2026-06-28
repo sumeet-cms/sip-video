@@ -118,11 +118,31 @@ def parse_rtp(payload):
 
 
 def depacketize_h264(packets):
-    """packets: list of (ext_seq, body). Return Annex-B bytes."""
+    """packets: list of (ext_seq, body). Return Annex-B bytes.
+
+    ext_seq is the unwrapped (monotonically increasing) RTP sequence number.
+    When a sequence-number gap is detected while a FU-A assembly is in
+    progress the incomplete NAL is *discarded* rather than emitted — emitting
+    a NAL with missing interior bytes produces a syntactically invalid H.264
+    bitstream that causes decoders to fail for all subsequent frames.
+    """
     out = bytearray()
     fu_buf = bytearray()
     fu_active = False
-    for _, body in packets:
+    prev_seq = None
+    gaps_reset = 0
+    for ext_seq, body in packets:
+        # Detect packet loss: any gap in the sequence number means one or more
+        # RTP packets were lost.  If a FU-A reassembly is in progress those
+        # missing packets are almost certainly FU-A middle/end fragments, so
+        # the NAL unit is incomplete — discard it to keep the bitstream clean.
+        if prev_seq is not None and ext_seq != prev_seq + 1:
+            if fu_active:
+                fu_active = False
+                fu_buf = bytearray()
+                gaps_reset += 1
+        prev_seq = ext_seq
+
         if not body:
             continue
         nal_type = body[0] & 0x1F
@@ -156,6 +176,10 @@ def depacketize_h264(packets):
                 fu_active = False
                 fu_buf = bytearray()
         # nal_type 25-27/29 (STAP-B/MTAP/FU-B) are uncommon for SIP; skipped.
+    if gaps_reset:
+        print(f"WARNING: {gaps_reset} incomplete FU-A NAL(s) discarded due to "
+              "RTP packet loss (sequence gaps); affected frames will be missing "
+              "but the bitstream remains valid.")
     return bytes(out)
 
 
@@ -256,7 +280,26 @@ def main():
         detected_fps = float(rounded_fps)
     fps_str = f"{detected_fps:.3f}".rstrip("0").rstrip(".")
 
-    annexb = depacketize_h264([(p[0], p[2]) for p in ordered])
+    # Compute monotonically-increasing (unwrapped) sequence numbers so the
+    # depacketizer can detect gaps caused by RTP packet loss.  The raw RTP
+    # sequence is 16-bit and wraps at 65535; the sort above already handles
+    # the wrap for ordering, but the raw values would produce a false "gap"
+    # (e.g. 65535 → 0 looks like a gap of 65535).
+    ext_packets = []
+    ext_seq = 0
+    prev_raw_seq = None
+    for p in ordered:
+        raw_seq = p[0]
+        if prev_raw_seq is not None:
+            diff = (raw_seq - prev_raw_seq) & 0xFFFF
+            # diff > 0x8000 would mean a large backwards jump — treat as 0
+            # (duplicate or reordered beyond the jitter window; skip).
+            if diff <= 0x8000:
+                ext_seq += diff
+        prev_raw_seq = raw_seq
+        ext_packets.append((ext_seq, p[2]))
+
+    annexb = depacketize_h264(ext_packets)
 
     h264_path = args.out + ".h264"
     with open(h264_path, "wb") as f:
@@ -269,8 +312,12 @@ def main():
         # Use the detected fps so the mp4 plays at real-time speed regardless
         # of the configured server frame rate.  -fflags +genpts regenerates PTS
         # from DTS (needed when the Annex-B stream lacks timing info).
+        # +genpts regenerates PTS from DTS (needed for Annex-B streams without
+        # timing info).  +discardcorrupt tells the demuxer to drop any corrupt
+        # packets rather than passing them into the muxer, which prevents a
+        # single bad frame from making the rest of the recording unplayable.
         cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "warning",
-               "-fflags", "+genpts", "-r", fps_str, "-i", h264_path,
+               "-fflags", "+genpts+discardcorrupt", "-r", fps_str, "-i", h264_path,
                "-c", "copy", mp4_path]
         print(f"Muxing to mp4 at {fps_str} fps:", " ".join(cmd))
         rc = subprocess.run(cmd).returncode

@@ -272,16 +272,15 @@ func (c *gstCompositor) AddInput(id string, codec InputCodec, clockRate int, pay
 	_ = flip.SetProperty("method", 8)
 	conv, _ := gst.NewElement("videoconvert")
 
-	// Camera tiles use crop-to-fill: aspectratiocrop trims the source to the
-	// tile's AR before videoscale, so the tile is always fully covered with no
-	// black letterbox bars.  Screenshares preserve their full content with
-	// letterboxing instead — cropping a screen would hide part of the shared
-	// application and confuse viewers.
+	// All inputs use crop-to-fill: aspectratiocrop trims the source to the
+	// tile's exact AR before videoscale so the tile is always fully covered
+	// with no black letterbox bars or empty space on any side.  For screen
+	// shares this means a small amount of edge content may be cropped, but
+	// the tile stays filled — which is the intended behaviour when the
+	// compositor is displaying screen share in a fixed-size tile.
 	var crop *gst.Element
-	if kind == KindCamera {
-		crop, _ = gst.NewElement("aspectratiocrop")
-		// AR will be set to the actual tile ratio in relayoutLocked.
-	}
+	crop, _ = gst.NewElement("aspectratiocrop")
+	// AR will be set to the actual tile ratio in relayoutLocked.
 
 	scale, _ := gst.NewElement("videoscale")
 	_ = scale.SetProperty("add-borders", true)
@@ -407,10 +406,10 @@ func (c *gstCompositor) ForceKeyFrame() {
 //
 //  Camera-only (or screen-only):
 //    Inputs fill the full canvas in a square-ish uniform grid.
-//    Each cell is W/cols × H/rows pixels.  Camera tiles use
-//    aspectratiocrop to center-crop the source to the tile's exact AR
-//    before scaling, so every tile is fully covered with no black bars.
-//    Screenshare-only grids letterbox instead to preserve full content.
+//    Each cell is W/cols × H/rows pixels.  All tiles (cameras and
+//    screenshares) use aspectratiocrop to center-crop the source to the
+//    tile's exact AR before scaling, so every tile is fully covered with
+//    no black bars or empty space on any side.
 //
 //    Examples for 1280×720:
 //      1 cam  → 1×1 → 1280×720 (full canvas)
@@ -466,9 +465,8 @@ func (c *gstCompositor) relayoutLocked() {
 
 // layoutGrid places len(inputs) tiles into the rectangle (xOff, yOff, w, h)
 // using the smallest square-ish grid.  Each cell is w/cols × h/rows pixels.
-// Camera tiles have an aspectratiocrop element that is updated here so the
+// All tiles have an aspectratiocrop element that is updated here so the
 // source is center-cropped to the tile AR before scaling (crop-to-fill).
-// Screenshare tiles do not have a cropper and use letterboxing instead.
 func (c *gstCompositor) layoutGrid(inputs []*gstInput, xOff, yOff, w, h int) {
 	n := len(inputs)
 	if n == 0 {
