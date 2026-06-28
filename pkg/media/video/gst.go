@@ -149,12 +149,6 @@ func NewCompositor(log logger.Logger, cfg Config, onSample func(Sample)) (Compos
 	if err := pipeline.SetState(gst.StatePlaying); err != nil {
 		return nil, err
 	}
-	// Record the real-world moment the pipeline enters PLAYING so that WriteRTP
-	// can derive valid GStreamer running-time PTS values even before the pipeline
-	// clock is handed to individual elements (GetClock returns nil briefly after
-	// startup with live sources, causing GST_CLOCK_TIME_NONE buffers that stall
-	// the compositor aggregator).
-	c.pipelineStartTime = time.Now()
 	log.Infow("§ GStreamer compositor pipeline started",
 		"width", cfg.Width, "height", cfg.Height, "fps", cfg.FPS, "bitrate_kbps", cfg.BitrateKbps,
 	)
@@ -173,9 +167,17 @@ type gstCompositor struct {
 	inputs map[string]*gstInput
 	closed bool
 
-	stopCh            chan struct{}
-	firstSample       sync.Once
-	pipelineStartTime time.Time // Go monotonic reference for PTS fallback
+	stopCh      chan struct{}
+	firstSample sync.Once
+
+	// ptsBase is the Go wall-clock time captured on the very first WriteRTP
+	// call across all inputs.  Using pipeline-creation time as the PTS origin
+	// caused the first ~15 s of encoded video to carry timestamps ≥15 s,
+	// making players / SIP decoders show a checkerboard for the opening 14-15 s
+	// of the recording (no frame existed for t=0..15 s in the H.264 stream).
+	// Anchoring to the first pushed buffer means the stream starts at PTS≈0.
+	ptsBase     time.Time
+	ptsBaseOnce sync.Once
 }
 
 func depayDecodeFor(codec InputCodec) (depay, decoder string, err error) {
@@ -243,6 +245,9 @@ func (c *gstCompositor) AddInput(id string, codec InputCodec, clockRate int, pay
 	}
 	conv, _ := gst.NewElement("videoconvert")
 	scale, _ := gst.NewElement("videoscale")
+	// Preserve aspect ratio by letterboxing / pillarboxing with black borders
+	// instead of stretching the source image to fill the tile dimensions.
+	_ = scale.SetProperty("add-borders", true)
 	queue, _ := gst.NewElement("queue")
 	scaleCaps, _ := gst.NewElement("capsfilter")
 
@@ -443,6 +448,15 @@ func (in *gstInput) WriteRTP(pkt []byte) error {
 	// is not yet available — this happens for a brief window right after
 	// startup with is-live=true sources, and is exactly the window we were
 	// previously pushing NONE-timestamped buffers.
+	// Anchor the PTS base to the real-world moment the very first RTP buffer
+	// is pushed (across all inputs).  Using the pipeline-creation time caused
+	// PTS values of ~14-15 s on the first buffers, so the H.264 output stream
+	// appeared to "start" 15 s into its own timeline — players showed a
+	// checkerboard for the opening 14-15 s of any recording because no frame
+	// existed for t=0..15 s.  With the base anchored here, the first frame has
+	// PTS≈0 and the stream plays back immediately.
+	in.comp.ptsBaseOnce.Do(func() { in.comp.ptsBase = time.Now() })
+
 	var ptsNs uint64
 	clockAvail := false
 	const clockNone = gst.ClockTime(^uint64(0))
@@ -455,10 +469,9 @@ func (in *gstInput) WriteRTP(pkt []byte) error {
 		}
 	}
 	if !clockAvail {
-		// Pipeline clock not yet distributed; use Go monotonic elapsed time
-		// relative to when the pipeline entered PLAYING. This produces valid,
-		// non-NONE timestamps that keep the compositor and jitterbuffer running.
-		elapsed := time.Since(in.comp.pipelineStartTime)
+		// Pipeline clock not yet available; derive PTS from Go monotonic time
+		// anchored to the first WriteRTP call so the stream starts at PTS≈0.
+		elapsed := time.Since(in.comp.ptsBase)
 		if elapsed < 0 {
 			elapsed = 0
 		}
