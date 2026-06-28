@@ -35,6 +35,64 @@ a=fmtp:97 profile-level-id=42e01f;packetization-mode=1
 a=sendrecv
 `
 
+const ciscoComplexOfferSDP = `v=0
+o=tandberg 0 2 IN IP4 10.6.1.113
+s=-
+c=IN IP4 164.100.103.40
+b=AS:4000
+t=0 0
+m=audio 45184 RTP/AVP 108 107 96 109 110 9 99 111 100 104 103 0 8 15 102 18 101
+a=rtpmap:108 opus/48000/2
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=sendrecv
+m=video 45316 RTP/AVP 97 116 96 34 31 121
+a=rtpmap:97 H264/90000
+a=fmtp:97 profile-level-id=428014;max-mbps=489600;max-fs=8160;max-cpb=4000;max-dpb=4752;max-br=3120;max-fps=6000
+a=rtpmap:116 H264/90000
+a=fmtp:116 profile-level-id=428014;max-mbps=489600;max-fs=8160;max-cpb=4000;max-dpb=4752;max-br=3120;max-fps=6000;packetization-mode=1
+a=rtpmap:96 H263-1998/90000
+a=rtcp-fb:* nack pli
+a=sendrecv
+a=content:main
+a=label:11
+a=rtcp:45317 IN IP4 164.100.103.40
+m=video 36716 RTP/AVP 97 116 96 34 121
+a=rtpmap:97 H264/90000
+a=fmtp:97 profile-level-id=428014;max-mbps=270000;max-fs=32400;max-cpb=4000;max-dpb=4752;max-br=3333;max-fps=3000
+a=rtpmap:116 H264/90000
+a=fmtp:116 profile-level-id=428014;max-mbps=270000;max-fs=32400;max-cpb=4000;max-dpb=4752;max-br=3333;max-fps=3000;packetization-mode=1
+a=sendrecv
+a=content:slides
+a=label:12
+a=rtcp:36717 IN IP4 164.100.103.40
+m=application 36188 UDP/BFCP *
+a=confid:1
+a=userid:15377
+a=floorid:2 mstrm:12
+a=floorctrl:s-only
+m=application 45560 UDP/UDT/IX *
+a=fingerprint:sha-256 29:CA:C2:64:BC:59:71:D9:41:0C:1F:51:12:18:EF:FC:98:84:37:06:4E:FD:0F:70:02:8F:04:D2:C1:F5:EA:56
+a=setup:actpass
+a=ixmap:0 ping
+a=ixmap:2 xccp
+`
+
+const audioOnlyAnswerSDP = `v=0
+o=- 3245388592986587240 3245388592986587244 IN IP4 135.235.161.185
+s=LiveKit
+c=IN IP4 135.235.161.185
+t=0 0
+m=audio 18637 RTP/AVP 9 101
+a=rtpmap:9 G722/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-16
+a=ptime:20
+a=sendrecv
+`
+
 func TestParseVideoOffer(t *testing.T) {
 	v, ok := parseVideoOffer([]byte(videoOfferSDP))
 	require.True(t, ok)
@@ -56,6 +114,31 @@ a=rtpmap:0 PCMU/8000
 `
 	_, ok := parseVideoOffer([]byte(audioOnly))
 	assert.False(t, ok)
+}
+
+func TestParseVideoOfferCiscoComplex(t *testing.T) {
+	v, ok := parseVideoOffer([]byte(ciscoComplexOfferSDP))
+	require.True(t, ok)
+	assert.Equal(t, byte(97), v.Type)
+	assert.Equal(t, VideoClockRate, v.ClockRate)
+	assert.Equal(t, "428014", v.ProfileLevelID)
+	assert.Equal(t, 1, v.PacketizationMode)
+	assert.Equal(t, "164.100.103.40:45316", v.Remote.String())
+}
+
+func TestSetVideoAnswerOnLocalSDP(t *testing.T) {
+	v, ok := parseVideoOffer([]byte(ciscoComplexOfferSDP))
+	require.True(t, ok)
+
+	updated, err := setVideoAnswerOnLocalSDP([]byte(audioOnlyAnswerSDP), 13645, v)
+	require.NoError(t, err)
+
+	parsed, ok := parseVideoOffer(updated)
+	require.True(t, ok)
+	assert.Equal(t, byte(97), parsed.Type)
+	assert.Equal(t, "428014", parsed.ProfileLevelID)
+	assert.Equal(t, 1, parsed.PacketizationMode)
+	assert.Equal(t, "135.235.161.185:13645", parsed.Remote.String())
 }
 
 func TestParseVideoOfferRejected(t *testing.T) {

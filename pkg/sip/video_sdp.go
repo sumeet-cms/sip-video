@@ -88,6 +88,25 @@ func addVideoAnswer(s *sdp.SessionDescription, port int, v *videoMediaConf) {
 	s.MediaDescriptions = append(s.MediaDescriptions, md)
 }
 
+// setVideoAnswerOnLocalSDP replaces any existing video m-lines in localSDP with
+// a single negotiated H.264 video answer.
+func setVideoAnswerOnLocalSDP(localSDP []byte, port int, v *videoMediaConf) ([]byte, error) {
+	var s sdp.SessionDescription
+	if err := s.Unmarshal(localSDP); err != nil {
+		return nil, err
+	}
+	media := s.MediaDescriptions[:0]
+	for _, md := range s.MediaDescriptions {
+		if strings.EqualFold(md.MediaName.Media, "video") {
+			continue
+		}
+		media = append(media, md)
+	}
+	s.MediaDescriptions = media
+	addVideoAnswer(&s, port, v)
+	return s.Marshal()
+}
+
 // rejectVideo appends a rejected (port 0) m=video answer to s, echoing the
 // offered payload types. Per RFC 3264 a declined media must still appear.
 func rejectVideo(s *sdp.SessionDescription, offered *sdp.MediaDescription) {

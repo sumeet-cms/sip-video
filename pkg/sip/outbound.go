@@ -514,6 +514,33 @@ func (c *outboundCall) setupOutboundVideo(v *videoMediaConf) error {
 	return nil
 }
 
+// handleReinviteOffer tries to apply media changes from an in-dialog re-INVITE.
+// For now we support mid-call H.264 video upgrades while keeping the existing
+// negotiated audio session unchanged.
+func (c *outboundCall) handleReinviteOffer(offerData []byte) ([]byte, error) {
+	if len(offerData) == 0 || c.media == nil || !c.media.VideoEnabled() {
+		return nil, nil
+	}
+	v, ok := parseVideoOffer(offerData)
+	if !ok {
+		return nil, nil
+	}
+	if err := c.setupOutboundVideo(v); err != nil {
+		return nil, err
+	}
+	localSDP := c.cc.LocalSDP()
+	if len(localSDP) == 0 {
+		return nil, nil
+	}
+	updatedLocalSDP, err := setVideoAnswerOnLocalSDP(localSDP, c.media.VideoPort(), v)
+	if err != nil {
+		return nil, err
+	}
+	c.media.EnableVideoOut()
+	c.cc.SetLocalSDP(updatedLocalSDP)
+	return updatedLocalSDP, nil
+}
+
 type sipRespFunc func(code sip.StatusCode, hdrs Headers)
 
 func sipResponse(ctx context.Context, tx sip.ClientTransaction, stop <-chan struct{}, setState sipRespFunc) (*sip.Response, error) {
