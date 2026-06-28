@@ -331,8 +331,10 @@ func (r *Room) subscribeTo(pub *lksdk.RemoteTrackPublication, rp *lksdk.RemotePa
 			return
 		}
 		log.Debugw("subscribing to a video track")
-		// Prefer a medium simulcast layer to limit decode/composite cost.
-		_ = pub.SetVideoQuality(livekit.VideoQuality_MEDIUM)
+		// Prefer the low simulcast layer: each participant is rendered as a small
+		// grid tile, so full-resolution decode is wasted CPU (2× VP8 decode +
+		// compositor + x264 encode easily exceeds 150% on a single call).
+		_ = pub.SetVideoQuality(livekit.VideoQuality_LOW)
 		if err := pub.SetSubscribed(true); err != nil {
 			log.Errorw("cannot subscribe to the video track", err)
 			return

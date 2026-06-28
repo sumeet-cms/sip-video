@@ -83,6 +83,9 @@ func NewCompositor(log logger.Logger, cfg Config, onSample func(Sample)) (Compos
 	_ = enc.SetProperty("speed-preset", 1) // ultrafast
 	_ = enc.SetProperty("byte-stream", true)
 	_ = enc.SetProperty("key-int-max", uint(cfg.FPS*int(cfg.KeyFrameInterval.Seconds())))
+	// Cap encoder threads so a single call does not fan out across all cores.
+	_ = enc.SetProperty("threads", uint(2))
+	_ = enc.SetProperty("option-string", "rc-lookahead=0:sync-lookahead=0:sliced-threads=0")
 
 	encCaps, err := gst.NewElement("capsfilter")
 	if err != nil {
@@ -243,19 +246,36 @@ func (c *gstCompositor) AddInput(id string, codec InputCodec, clockRate int, pay
 	if err != nil {
 		return nil, err
 	}
+	// Disable VP8 post-processing / deblocking to reduce decode CPU. Quality
+	// loss is negligible at SIP tile sizes (each tile is a fraction of 720p).
+	if codec == CodecVP8 {
+		_ = dec.SetProperty("post-processing", false)
+		_ = dec.SetProperty("deblock", false)
+	}
 	conv, _ := gst.NewElement("videoconvert")
+	rate, _ := gst.NewElement("videorate")
+	rateCaps, _ := gst.NewElement("capsfilter")
+	_ = rateCaps.SetProperty("caps", gst.NewCapsFromString(
+		fmt.Sprintf("video/x-raw,framerate=%d/1", c.cfg.FPS),
+	))
 	scale, _ := gst.NewElement("videoscale")
 	// Preserve aspect ratio by letterboxing / pillarboxing with black borders
 	// instead of stretching the source image to fill the tile dimensions.
 	_ = scale.SetProperty("add-borders", true)
 	queue, _ := gst.NewElement("queue")
+	// Drop stale frames instead of letting the queue grow — keeps latency and
+	// CPU bounded when the compositor momentarily falls behind.
+	_ = queue.SetProperty("max-size-buffers", uint(2))
+	_ = queue.SetProperty("max-size-time", uint64(0))
+	_ = queue.SetProperty("max-size-bytes", uint(0))
+	_ = queue.SetProperty("leaky", 2) // downstream
 	scaleCaps, _ := gst.NewElement("capsfilter")
 
 	in := &gstInput{
 		id:     id,
 		comp:   c,
 		src:    src,
-		elems:  []*gst.Element{src.Element, jitter, depay, dec, conv, scale, scaleCaps, queue},
+		elems:  []*gst.Element{src.Element, jitter, depay, dec, conv, rate, rateCaps, scale, scaleCaps, queue},
 		scaler: scaleCaps,
 	}
 

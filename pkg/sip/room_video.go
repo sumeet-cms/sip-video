@@ -31,7 +31,7 @@ import (
 
 // keyFrameRequestInterval is how often we re-request key frames from room
 // participants, ensuring newly added/recovered tiles refresh quickly.
-const keyFrameRequestInterval = 3 * time.Second
+const keyFrameRequestInterval = 5 * time.Second
 
 // VideoEnabled reports whether video compositing is active for this room.
 func (r *Room) VideoEnabled() bool {
