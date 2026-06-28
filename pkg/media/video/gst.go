@@ -419,16 +419,11 @@ func (c *gstCompositor) ForceKeyFrame() {
 //      5 cams → 3×2 →  426×360
 //      6 cams → 3×2 →  426×360 (last cell empty)
 //
-//  Mixed (screens + cameras) — 70/30 split:
-//    ┌────────────────────┬──────────┐
-//    │   screen-share(s)  │ camera 1 │
-//    │    main area       │ camera 2 │
-//    │  (70 % of width)   │   ...    │
-//    └────────────────────┴──────────┘
-//    Screen-shares fill the left 70 % of the canvas (896 px at 1280-wide);
-//    cameras fill the right 30 % (384 px) and are stacked vertically.
-//    The wider camera strip (vs the old 25 %) gives each camera tile more
-//    room while the screenshare still dominates the layout.
+//  Mixed (screens + cameras):
+//    Screenshare(s) fill the entire canvas.  Camera tiles are parked
+//    off-canvas (xpos = -W) so their decode/scale pipelines keep running
+//    and can snap back instantly when the screenshare ends — no pipeline
+//    teardown or re-negotiation required.
 //
 // Inputs are sorted by ID before placement so the tile order is deterministic
 // across relayout calls (participants join/leave do not shuffle existing tiles).
@@ -455,19 +450,17 @@ func (c *gstCompositor) relayoutLocked() {
 
 	W, H := c.cfg.Width, c.cfg.Height
 
-	if len(screens) == 0 || len(cameras) == 0 {
-		// Only one kind present: fill the entire canvas.
-		inputs := cameras
-		if len(screens) > 0 {
-			inputs = screens
-		}
-		c.layoutGrid(inputs, 0, 0, W, H)
+	if len(screens) > 0 {
+		// Screenshare active: give it the full canvas.
+		c.layoutGrid(screens, 0, 0, W, H)
+		// Park cameras off-canvas to the left.  The compositor clips anything
+		// with xpos < 0, so these tiles are invisible but their pipelines stay
+		// fully alive — when the screenshare ends they snap back to the grid
+		// with zero latency on the next relayout call.
+		c.layoutGrid(cameras, -W, 0, W, H)
 	} else {
-		// Mixed: screenshare(s) on the left (70 % width), cameras on the right (30 % width).
-		mainW := W * 7 / 10
-		stripW := W - mainW
-		c.layoutGrid(screens, 0, 0, mainW, H)
-		c.layoutGrid(cameras, mainW, 0, stripW, H)
+		// No screenshare: cameras fill the full canvas in a uniform grid.
+		c.layoutGrid(cameras, 0, 0, W, H)
 	}
 }
 
