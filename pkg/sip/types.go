@@ -171,6 +171,20 @@ func (u URI) GetURI() *sip.Uri {
 	return su
 }
 
+// GetDestinationURI returns a SIP URI suitable for Request-URI / To headers.
+// Transport is intentionally excluded because some SBCs treat URI parameters
+// as part of policy matching for called aliases.
+func (u URI) GetDestinationURI() *sip.Uri {
+	su := &sip.Uri{
+		User: u.User,
+		Host: u.GetHost(),
+	}
+	if port := u.Addr.Port(); port != 0 {
+		su.Port = int(port)
+	}
+	return su
+}
+
 func (u URI) GetContactURI() *sip.Uri {
 	su := u.GetURI()
 	switch u.Transport {

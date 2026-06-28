@@ -22,6 +22,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/sipgo/sip"
 )
 
@@ -121,6 +122,55 @@ func TestOutboundRouteHeaderWithRecordRoute(t *testing.T) {
 	require.Equal(t, 2, len(ackRouteHeaders)) // We expect this to fail prior to fixing our bug!
 	require.Equal(t, initialRouteHeader.Value(), ackRouteHeaders[0].Value())
 	require.Equal(t, addedRouteHeader.Value(), ackRouteHeaders[1].Value())
+
+	cancel()
+}
+
+func TestOutboundInviteUsesTransportWithoutURIParam(t *testing.T) {
+	client := NewOutboundTestClient(t, TestClientConfig{})
+	req := MinimalCreateSIPParticipantRequest()
+	req.Transport = livekit.SIPTransport_SIP_TRANSPORT_TCP
+	req.CallTo = "1500631"
+	req.Address = "govmeet.vc.nic.in"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_, _ = client.CreateSIPParticipant(ctx, req)
+	}()
+
+	var sipClient *testSIPClient
+	select {
+	case sipClient = <-createdClients:
+		t.Cleanup(func() { _ = sipClient.Close() })
+	case <-time.After(100 * time.Millisecond):
+		require.Fail(t, "expected client to be created")
+		return
+	}
+
+	var tr *transactionRequest
+	select {
+	case tr = <-sipClient.transactions:
+		t.Cleanup(func() { tr.transaction.Terminate() })
+	case <-time.After(500 * time.Millisecond):
+		require.Fail(t, "expected INVITE transaction request")
+		return
+	}
+
+	require.Equal(t, sip.INVITE, tr.req.Method)
+	require.Equal(t, "TCP", tr.req.Transport())
+	require.Equal(t, "1500631", tr.req.Recipient.User)
+	require.Equal(t, "govmeet.vc.nic.in", tr.req.Recipient.Host)
+	_, hasRecipientTransport := tr.req.Recipient.UriParams.Get("transport")
+	require.False(t, hasRecipientTransport, "recipient URI must not include transport parameter")
+
+	toHeader := tr.req.To()
+	require.NotNil(t, toHeader)
+	_, hasToTransport := toHeader.Address.UriParams.Get("transport")
+	require.False(t, hasToTransport, "To header URI must not include transport parameter")
+
+	// Terminate call setup cleanly so the async dial goroutine exits during test.
+	require.NoError(t, tr.transaction.SendResponse(sip.NewResponseFromRequest(tr.req, sip.StatusNotFound, "Not Found", nil)))
 
 	cancel()
 }

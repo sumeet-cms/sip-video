@@ -21,6 +21,7 @@ import (
 	"net"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -932,7 +933,7 @@ func (c *sipOutbound) Invite(ctx context.Context, to URI, user, pass string, hea
 	defer span.End()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	toHeader := &sip.ToHeader{Address: *to.GetURI()}
+	toHeader := &sip.ToHeader{Address: *to.GetDestinationURI()}
 
 	var (
 		sipHeaders         Headers
@@ -953,7 +954,7 @@ authLoop:
 		if try >= 5 {
 			return nil, psrpc.NewError(psrpc.FailedPrecondition, ErrAuthMaxRetry)
 		}
-		req, resp, err = c.attemptInvite(ctx, sip.CallIDHeader(c.callID), toHeader, sdpOffer, authHeaderRespName, authHeader, sipHeaders, setState)
+		req, resp, err = c.attemptInvite(ctx, sip.CallIDHeader(c.callID), toHeader, to.Transport, sdpOffer, authHeaderRespName, authHeader, sipHeaders, setState)
 		if err != nil {
 			return nil, err
 		}
@@ -1067,10 +1068,13 @@ func (c *sipOutbound) AckInviteOK(ctx context.Context) error {
 	return c.c.sipCli.WriteRequest(sip.NewAckRequest(c.invite, c.inviteOk, nil))
 }
 
-func (c *sipOutbound) attemptInvite(ctx context.Context, callID sip.CallIDHeader, to *sip.ToHeader, offer []byte, authHeaderName, authHeader string, headers Headers, setState sipRespFunc) (*sip.Request, *sip.Response, error) {
+func (c *sipOutbound) attemptInvite(ctx context.Context, callID sip.CallIDHeader, to *sip.ToHeader, transport Transport, offer []byte, authHeaderName, authHeader string, headers Headers, setState sipRespFunc) (*sip.Request, *sip.Response, error) {
 	ctx, span := Tracer.Start(ctx, "sip.outbound.attemptInvite")
 	defer span.End()
 	req := sip.NewRequest(sip.INVITE, to.Address)
+	if transport != "" {
+		req.SetTransport(strings.ToUpper(string(transport)))
+	}
 	c.setCSeq(req)
 	req.RemoveHeader("Call-ID")
 	req.AppendHeader(&callID)
