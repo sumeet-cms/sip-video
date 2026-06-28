@@ -105,6 +105,7 @@ func NewCompositor(log logger.Logger, cfg Config, onSample func(Sample)) (Compos
 		comp:     comp,
 		enc:      enc,
 		inputs:   make(map[string]*gstInput),
+		stopCh:   make(chan struct{}),
 	}
 
 	sink.SetCallbacks(&app.SinkCallbacks{
@@ -121,6 +122,12 @@ func NewCompositor(log logger.Logger, cfg Config, onSample func(Sample)) (Compos
 			if len(data) == 0 {
 				return gst.FlowOK
 			}
+			c.firstSample.Do(func() {
+				c.log.Infow("§ first composited frame from GStreamer appsink",
+					"data_len", len(data),
+					"keyframe", !buf.HasFlags(gst.BufferFlagDeltaUnit),
+				)
+			})
 			out := Sample{
 				Data:     data,
 				Duration: clockTimeToDuration(buf.Duration()),
@@ -142,6 +149,10 @@ func NewCompositor(log logger.Logger, cfg Config, onSample func(Sample)) (Compos
 	if err := pipeline.SetState(gst.StatePlaying); err != nil {
 		return nil, err
 	}
+	log.Infow("§ GStreamer compositor pipeline started",
+		"width", cfg.Width, "height", cfg.Height, "fps", cfg.FPS, "bitrate_kbps", cfg.BitrateKbps,
+	)
+	go c.watchBus()
 	return c, nil
 }
 
@@ -155,6 +166,9 @@ type gstCompositor struct {
 	mu     sync.Mutex
 	inputs map[string]*gstInput
 	closed bool
+
+	stopCh      chan struct{}
+	firstSample sync.Once
 }
 
 func depayDecodeFor(codec InputCodec) (depay, decoder string, err error) {
@@ -252,11 +266,24 @@ func (c *gstCompositor) AddInput(id string, codec InputCodec, clockRate int, pay
 	}
 
 	for _, e := range in.elems {
-		e.SyncStateWithParent()
+		if ok := e.SyncStateWithParent(); !ok {
+			c.log.Warnw("§ GStreamer element failed to sync state with parent pipeline", nil,
+				"input_id", id, "element", e.GetName(),
+			)
+		}
 	}
 
 	c.inputs[id] = in
 	c.relayoutLocked()
+	c.log.Infow("§ video tile added to GStreamer compositor",
+		"id", id,
+		"codec", codec,
+		"clock_rate", clockRate,
+		"payload_type", payloadType,
+		"depay", depayName,
+		"decoder", decName,
+		"total_inputs", len(c.inputs),
+	)
 	return in, nil
 }
 
@@ -326,11 +353,55 @@ func (c *gstCompositor) Close() error {
 		return nil
 	}
 	c.closed = true
+	if c.stopCh != nil {
+		close(c.stopCh)
+	}
 	for id, in := range c.inputs {
 		in.teardownLocked()
 		delete(c.inputs, id)
 	}
 	return c.pipeline.SetState(gst.StateNull)
+}
+
+// watchBus polls the GStreamer pipeline bus for error and warning messages and
+// logs them with the § diagnostic prefix. It runs as a background goroutine
+// until Close() signals stopCh.
+func (c *gstCompositor) watchBus() {
+	bus := c.pipeline.GetBus()
+	if bus == nil {
+		c.log.Warnw("§ GStreamer pipeline bus unavailable; error monitoring disabled", nil)
+		return
+	}
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-ticker.C:
+			// Drain all pending error/warning/EOS messages without blocking.
+			for {
+				msg := bus.PopFiltered(gst.MessageError | gst.MessageWarning | gst.MessageEOS)
+				if msg == nil {
+					break
+				}
+				switch msg.Type() {
+				case gst.MessageError:
+					gerr := msg.ParseError()
+					c.log.Errorw("§ GStreamer pipeline error", gerr,
+						"debug", gerr.DebugString(), "src", msg.Source(),
+					)
+				case gst.MessageWarning:
+					gerr := msg.ParseWarning()
+					c.log.Warnw("§ GStreamer pipeline warning", gerr,
+						"debug", gerr.DebugString(), "src", msg.Source(),
+					)
+				case gst.MessageEOS:
+					c.log.Warnw("§ GStreamer pipeline EOS received", nil, "src", msg.Source())
+				}
+			}
+		}
+	}
 }
 
 type gstInput struct {
@@ -341,28 +412,60 @@ type gstInput struct {
 	scaler  *gst.Element
 	compPad *gst.Pad
 	closed  bool
+
+	// diagnostics — written only by the single RTP-pump goroutine
+	pktCount uint64
+	firstPkt sync.Once
 }
 
 func (in *gstInput) WriteRTP(pkt []byte) error {
 	if in.closed {
 		return nil
 	}
+	in.pktCount++
+
 	buf := gst.NewBufferFromBytes(pkt)
 	// Stamp the buffer with the pipeline's current running time.
 	// Without a PTS, the rtpjitterbuffer cannot estimate packet arrival
 	// order in the fallback (no-RTCP) path, which would stall the
 	// pipeline even with mode=NONE.
+	var ptsNs uint64
+	clockAvail := false
 	if clock := in.comp.pipeline.GetClock(); clock != nil {
+		clockAvail = true
 		base := in.comp.pipeline.GetBaseTime()
 		now := clock.GetTime()
 		// GST_CLOCK_TIME_NONE == ^ClockTime(0); guard against it and
 		// against now < base (pipeline not yet running).
 		const clockNone = gst.ClockTime(^uint64(0))
 		if now != clockNone && base != clockNone && now >= base {
-			buf.SetPresentationTimestamp(now - base)
+			pts := now - base
+			ptsNs = uint64(pts)
+			buf.SetPresentationTimestamp(pts)
 		}
 	}
+
+	in.firstPkt.Do(func() {
+		in.comp.log.Infow("§ first RTP packet pushed to GStreamer appsrc",
+			"input_id", in.id,
+			"pkt_len", len(pkt),
+			"clock_available", clockAvail,
+			"pts_ns", ptsNs,
+		)
+	})
+	if in.pktCount%200 == 0 {
+		in.comp.log.Debugw("§ RTP packets pushed to GStreamer appsrc (periodic)",
+			"input_id", in.id, "count", in.pktCount,
+		)
+	}
+
 	if r := in.src.PushBuffer(buf); r != gst.FlowOK {
+		if in.pktCount <= 5 || in.pktCount%200 == 0 {
+			in.comp.log.Warnw("§ GStreamer appsrc PushBuffer returned non-OK flow",
+				fmt.Errorf("flow: %v", r),
+				"input_id", in.id, "flow", r, "pkt_count", in.pktCount,
+			)
+		}
 		return fmt.Errorf("push buffer: %v", r)
 	}
 	return nil

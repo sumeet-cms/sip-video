@@ -125,6 +125,9 @@ func (r *Room) handleVideoTrack(log logger.Logger, track *webrtc.TrackRemote, pu
 
 	// Request an initial key frame so the decoder can start immediately, and a
 	// fresh key frame for the SIP encoder.
+	log.Infow("§ sending initial PLI to request keyframe from participant",
+		"ssrc", track.SSRC(), "codec", track.Codec().MimeType,
+	)
 	rp.WritePLI(track.SSRC())
 	comp.ForceKeyFrame()
 
@@ -141,6 +144,7 @@ func (r *Room) handleVideoTrack(log logger.Logger, track *webrtc.TrackRemote, pu
 			case <-r.stopped.Watch():
 				return
 			case <-t.C:
+				log.Debugw("§ periodic PLI sent to participant", "ssrc", track.SSRC())
 				rp.WritePLI(track.SSRC())
 			}
 		}
@@ -148,6 +152,7 @@ func (r *Room) handleVideoTrack(log logger.Logger, track *webrtc.TrackRemote, pu
 
 	const maxConsecutiveErrors = 10
 	consecutiveErrors := 0
+	var rtpCount uint64
 	for {
 		pkt, _, err := track.ReadRTP()
 		if err != nil {
@@ -159,6 +164,13 @@ func (r *Room) handleVideoTrack(log logger.Logger, track *webrtc.TrackRemote, pu
 		raw, err := pkt.Marshal()
 		if err != nil {
 			continue
+		}
+		rtpCount++
+		if rtpCount == 1 || rtpCount == 5 || rtpCount == 20 || rtpCount%500 == 0 {
+			log.Infow("§ VP8 RTP packet read from LiveKit track",
+				"rtp_count", rtpCount, "seq", pkt.SequenceNumber, "ssrc", pkt.SSRC,
+				"payload_len", len(pkt.Payload), "marker", pkt.Marker,
+			)
 		}
 		if err := in.WriteRTP(raw); err != nil {
 			consecutiveErrors++
