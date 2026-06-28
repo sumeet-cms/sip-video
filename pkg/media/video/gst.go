@@ -170,13 +170,16 @@ func depayDecodeFor(codec InputCodec) (depay, decoder string, err error) {
 	}
 }
 
-func (c *gstCompositor) AddInput(id string, codec InputCodec, clockRate int) (Input, error) {
+func (c *gstCompositor) AddInput(id string, codec InputCodec, clockRate int, payloadType int) (Input, error) {
 	depayName, decName, err := depayDecodeFor(codec)
 	if err != nil {
 		return nil, err
 	}
 	if clockRate <= 0 {
 		clockRate = H264ClockRate
+	}
+	if payloadType <= 0 {
+		payloadType = 96 // dynamic range default; overridden by actual negotiated PT
 	}
 
 	c.mu.Lock()
@@ -196,7 +199,7 @@ func (c *gstCompositor) AddInput(id string, codec InputCodec, clockRate int) (In
 	src.SetProperty("format", gst.FormatTime)
 	encName := map[InputCodec]string{CodecVP8: "VP8", CodecVP9: "VP9", CodecH264: "H264"}[codec]
 	src.SetCaps(gst.NewCapsFromString(fmt.Sprintf(
-		"application/x-rtp,media=video,encoding-name=%s,clock-rate=%d,payload=96", encName, clockRate,
+		"application/x-rtp,media=video,encoding-name=%s,clock-rate=%d,payload=%d", encName, clockRate, payloadType,
 	)))
 
 	jitter, _ := gst.NewElement("rtpjitterbuffer")

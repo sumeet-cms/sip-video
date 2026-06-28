@@ -72,6 +72,18 @@ func (r *Room) EnableVideo(cfg video.Config, stats *VideoStats) error {
 	return nil
 }
 
+// ForceKeyFrame requests the GStreamer encoder to emit a fresh IDR frame as
+// soon as possible. Call this after enabling video output so the SIP client
+// can start decoding from a clean state.
+func (r *Room) ForceKeyFrame() {
+	r.videoMu.Lock()
+	comp := r.comp
+	r.videoMu.Unlock()
+	if comp != nil {
+		comp.ForceKeyFrame()
+	}
+}
+
 // SwapVideoOutput sets the destination for composited video (the SIP video
 // writer) and returns the previous one.
 func (r *Room) SwapVideoOutput(w videoSampleWriter) videoSampleWriter {
@@ -87,11 +99,9 @@ func (r *Room) handleVideoTrack(log logger.Logger, track *webrtc.TrackRemote, pu
 	r.videoMu.Lock()
 	comp := r.comp
 	r.videoMu.Unlock()
-	log.Infow("GOT HERE handleVideoTrack", "comp", comp)
 	if comp == nil {
 		return
 	}
-	log.Infow("GOT HERE handleVideoTrack 11111", "comp", comp)
 
 	codec := video.CodecFromMimeType(track.Codec().MimeType)
 	if codec == video.CodecUnknown {
@@ -99,7 +109,7 @@ func (r *Room) handleVideoTrack(log logger.Logger, track *webrtc.TrackRemote, pu
 		return
 	}
 	id := pub.SID()
-	in, err := comp.AddInput(id, codec, int(track.Codec().ClockRate))
+	in, err := comp.AddInput(id, codec, int(track.Codec().ClockRate), int(track.Codec().PayloadType))
 	if err != nil {
 		log.Errorw("cannot add compositor input", err)
 		return
@@ -136,6 +146,8 @@ func (r *Room) handleVideoTrack(log logger.Logger, track *webrtc.TrackRemote, pu
 		}
 	}()
 
+	const maxConsecutiveErrors = 10
+	consecutiveErrors := 0
 	for {
 		pkt, _, err := track.ReadRTP()
 		if err != nil {
@@ -149,9 +161,15 @@ func (r *Room) handleVideoTrack(log logger.Logger, track *webrtc.TrackRemote, pu
 			continue
 		}
 		if err := in.WriteRTP(raw); err != nil {
-			log.Debugw("compositor input write failed", "error", err)
-			return
+			consecutiveErrors++
+			if consecutiveErrors >= maxConsecutiveErrors {
+				log.Warnw("compositor input write failed repeatedly, closing tile", err, "consecutive_errors", consecutiveErrors)
+				return
+			}
+			log.Debugw("compositor input write failed (transient)", "error", err, "consecutive_errors", consecutiveErrors)
+			continue
 		}
+		consecutiveErrors = 0
 	}
 }
 

@@ -171,6 +171,7 @@ type RoomInterface interface {
 	EnableVideo(cfg video.Config, stats *VideoStats) error
 	SwapVideoOutput(w videoSampleWriter) videoSampleWriter
 	NewParticipantVideoTrack() (VideoTrackWriter, error)
+	ForceKeyFrame()
 }
 
 // VideoTrackWriter publishes encoded H.264 access units (from the SIP endpoint)
@@ -322,7 +323,10 @@ func (r *Room) subscribeTo(pub *lksdk.RemoteTrackPublication, rp *lksdk.RemotePa
 		r.subscribed.Break()
 	case lksdk.TrackKindVideo:
 		// Only subscribe to video when compositing is enabled.
-		if r.comp == nil {
+		r.videoMu.Lock()
+		compReady := r.comp != nil
+		r.videoMu.Unlock()
+		if !compReady {
 			log.Debugw("skipping video track - video disabled")
 			return
 		}

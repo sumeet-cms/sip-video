@@ -286,6 +286,8 @@ func (r *testRoom) NewParticipantVideoTrack() (VideoTrackWriter, error) {
 	return nil, video.ErrNotSupported
 }
 
+func (r *testRoom) ForceKeyFrame() {}
+
 type testSIPClientTransaction struct {
 	log       logger.Logger
 	responses chan *sip.Response

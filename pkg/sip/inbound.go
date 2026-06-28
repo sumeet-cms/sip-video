@@ -925,6 +925,9 @@ func (c *inboundCall) handleInvite(ctx context.Context, tid traceid.ID, req *sip
 		c.media.EnableOut()
 		if c.videoEnabled {
 			c.media.EnableVideoOut()
+			// Request an IDR from the encoder so the SIP client can start
+			// decoding from a clean state immediately after the call is accepted.
+			c.lkRoom.ForceKeyFrame()
 		}
 		if ok, err := c.waitMedia(ctx); !ok {
 			return false, err

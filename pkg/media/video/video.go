@@ -135,8 +135,9 @@ type Input interface {
 type Compositor interface {
 	// AddInput registers a new participant tile. id must be unique for the
 	// lifetime of the compositor. clockRate is the RTP clock rate of the input
-	// track (typically 90000 for video).
-	AddInput(id string, codec InputCodec, clockRate int) (Input, error)
+	// track (typically 90000 for video). payloadType is the negotiated RTP
+	// dynamic payload type for the codec on this track.
+	AddInput(id string, codec InputCodec, clockRate int, payloadType int) (Input, error)
 	// RemoveInput removes a participant tile by id. It is safe to call with an
 	// unknown id.
 	RemoveInput(id string)
