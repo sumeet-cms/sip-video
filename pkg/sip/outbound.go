@@ -514,31 +514,36 @@ func (c *outboundCall) setupOutboundVideo(v *videoMediaConf) error {
 	return nil
 }
 
-// handleReinviteOffer tries to apply media changes from an in-dialog re-INVITE.
-// For now we support mid-call H.264 video upgrades while keeping the existing
-// negotiated audio session unchanged.
-func (c *outboundCall) handleReinviteOffer(offerData []byte) ([]byte, error) {
+// prepareReinviteOffer builds a non-blocking SDP answer update for a re-INVITE.
+// It never touches room/track state, so it is safe to run on the signaling path.
+func (c *outboundCall) prepareReinviteOffer(offerData []byte) ([]byte, *videoMediaConf, error) {
 	if len(offerData) == 0 || c.media == nil || !c.media.VideoEnabled() {
-		return nil, nil
+		return nil, nil, nil
 	}
 	v, ok := parseVideoOffer(offerData)
 	if !ok {
-		return nil, nil
-	}
-	if err := c.setupOutboundVideo(v); err != nil {
-		return nil, err
+		return nil, nil, nil
 	}
 	localSDP := c.cc.LocalSDP()
 	if len(localSDP) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	updatedLocalSDP, err := setVideoAnswerOnLocalSDP(localSDP, c.media.VideoPort(), v)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	return updatedLocalSDP, v, nil
+}
+
+func (c *outboundCall) applyReinviteVideo(v *videoMediaConf) {
+	if v == nil || c.stopped.IsBroken() {
+		return
+	}
+	if err := c.setupOutboundVideo(v); err != nil {
+		c.log.Warnw("cannot apply reinvite video changes", err)
+		return
 	}
 	c.media.EnableVideoOut()
-	c.cc.SetLocalSDP(updatedLocalSDP)
-	return updatedLocalSDP, nil
 }
 
 type sipRespFunc func(code sip.StatusCode, hdrs Headers)

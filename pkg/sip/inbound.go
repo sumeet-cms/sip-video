@@ -391,10 +391,13 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 		if oc != nil && oc.cc != nil && oc.cc.InviteCSeq() < newCSeq {
 			sdp := oc.cc.LocalSDP()
 			if len(sdp) != 0 {
-				if updatedSDP, err := oc.handleReinviteOffer(req.Body()); err != nil {
-					oc.log.Warnw("cannot apply reinvite media changes, keeping previous SDP", err)
+				if updatedSDP, vconf, err := oc.prepareReinviteOffer(req.Body()); err != nil {
+					oc.log.Warnw("cannot prepare reinvite media changes, keeping previous SDP", err)
 				} else if len(updatedSDP) != 0 {
 					sdp = updatedSDP
+					oc.cc.SetLocalSDP(updatedSDP)
+					// Keep SIP signaling responsive: apply room/video plumbing async.
+					go oc.applyReinviteVideo(vconf)
 				}
 				oc.log.Infow("accepting reinvite", "content-type", req.ContentType(), "content-length", req.ContentLength(), "cseq", cc.InviteCSeq())
 				oc.cc.RecordInvite(newCSeq)
