@@ -271,23 +271,44 @@ func (c *gstCompositor) AddInput(id string, codec InputCodec, clockRate int, pay
 	flip, _ := gst.NewElement("videoflip")
 	_ = flip.SetProperty("method", 8)
 	conv, _ := gst.NewElement("videoconvert")
+
+	// Camera tiles use crop-to-fill: aspectratiocrop trims the source to the
+	// tile's AR before videoscale, so the tile is always fully covered with no
+	// black letterbox bars.  Screenshares preserve their full content with
+	// letterboxing instead — cropping a screen would hide part of the shared
+	// application and confuse viewers.
+	var crop *gst.Element
+	if kind == KindCamera {
+		crop, _ = gst.NewElement("aspectratiocrop")
+		// AR will be set to the actual tile ratio in relayoutLocked.
+	}
+
 	scale, _ := gst.NewElement("videoscale")
-	// Preserve aspect ratio by letterboxing / pillarboxing with black borders
-	// instead of stretching the source image to fill the tile dimensions.
 	_ = scale.SetProperty("add-borders", true)
 	scaleCaps, _ := gst.NewElement("capsfilter")
 
-	// Optional name label rendered at the bottom of each tile.
-	elems := []*gst.Element{src.Element, jitter, depay, dec, flip, conv, scale, scaleCaps}
+	// Build the per-tile element chain.  The text overlay is placed *after*
+	// scaleCaps so that:
+	//   • font size is expressed in tile pixels (predictable, tile-relative)
+	//   • with crop-to-fill active for cameras, the tile frame contains only
+	//     real video — so "valignment=bottom" lands on video content, never in
+	//     a letterbox bar
+	var elems []*gst.Element
+	if crop != nil {
+		elems = []*gst.Element{src.Element, jitter, depay, dec, flip, conv, crop, scale, scaleCaps}
+	} else {
+		elems = []*gst.Element{src.Element, jitter, depay, dec, flip, conv, scale, scaleCaps}
+	}
 	if label != "" {
 		overlay, _ := gst.NewElement("textoverlay")
 		_ = overlay.SetProperty("text", label)
-		_ = overlay.SetProperty("valignment", 1)    // bottom
-		_ = overlay.SetProperty("halignment", 1)    // center
-		_ = overlay.SetProperty("font-desc", "Sans Bold 14")
+		_ = overlay.SetProperty("valignment", 1)             // bottom
+		_ = overlay.SetProperty("halignment", 1)             // center
+		_ = overlay.SetProperty("font-desc", "Sans Bold 16")
 		_ = overlay.SetProperty("color", uint(0xFFFFFFFF))        // white text
 		_ = overlay.SetProperty("outline-color", uint(0xFF000000)) // black outline
-		_ = overlay.SetProperty("shading-value", 0.4)
+		_ = overlay.SetProperty("shading-value", 0.5)
+		_ = overlay.SetProperty("ypad", 20) // keep text clear of the bottom edge
 		elems = append(elems, overlay)
 	}
 
@@ -302,12 +323,13 @@ func (c *gstCompositor) AddInput(id string, codec InputCodec, clockRate int, pay
 	elems = append(elems, queue)
 
 	in := &gstInput{
-		id:     id,
-		kind:   kind,
-		comp:   c,
-		src:    src,
-		elems:  elems,
-		scaler: scaleCaps,
+		id:      id,
+		kind:    kind,
+		comp:    c,
+		src:     src,
+		elems:   elems,
+		scaler:  scaleCaps,
+		cropper: crop,
 	}
 
 	if err := c.pipeline.AddMany(in.elems...); err != nil {
@@ -384,25 +406,29 @@ func (c *gstCompositor) ForceKeyFrame() {
 // -----------------------------------------
 //
 //  Camera-only (or screen-only):
-//    Inputs fill the full canvas in the smallest square-ish grid.
-//    Each cell is W/cols × H/rows, fully covering the canvas.
-//    videoscale(add-borders=true) letterboxes/pillarboxes source content
-//    inside each cell so nothing is ever cropped.
+//    Inputs fill the full canvas in a square-ish uniform grid.
+//    Each cell is W/cols × H/rows pixels.  Camera tiles use
+//    aspectratiocrop to center-crop the source to the tile's exact AR
+//    before scaling, so every tile is fully covered with no black bars.
+//    Screenshare-only grids letterbox instead to preserve full content.
 //
 //    Examples for 1280×720:
-//      1 input  → 1×1 → cell 1280×720  (full canvas)
-//      2 inputs → 2×1 → cell  640×720  (source 16:9 letterboxed, 180 px bars)
-//      4 inputs → 2×2 → cell  640×360  (source 16:9, perfect fill)
+//      1 cam  → 1×1 → 1280×720 (full canvas)
+//      2 cams → 2×1 →  640×720 (portrait tile, source center-cropped)
+//      4 cams → 2×2 →  640×360 (16:9 tile, perfect fit)
+//      5 cams → 3×2 →  426×360
+//      6 cams → 3×2 →  426×360 (last cell empty)
 //
-//  Mixed (screens + cameras):
-//    ┌──────────────────┬──────────┐
-//    │  screen-share(s) │ camera 1 │
-//    │    main area     │ camera 2 │
-//    │  (3/4 of width)  │   ...    │
-//    └──────────────────┴──────────┘
-//    Screen-shares fill the left 3/4 of the canvas; cameras stack in the
-//    remaining 1/4 strip on the right.  This matches the standard
-//    "presentation mode" found in video-conferencing apps.
+//  Mixed (screens + cameras) — 70/30 split:
+//    ┌────────────────────┬──────────┐
+//    │   screen-share(s)  │ camera 1 │
+//    │    main area       │ camera 2 │
+//    │  (70 % of width)   │   ...    │
+//    └────────────────────┴──────────┘
+//    Screen-shares fill the left 70 % of the canvas (896 px at 1280-wide);
+//    cameras fill the right 30 % (384 px) and are stacked vertically.
+//    The wider camera strip (vs the old 25 %) gives each camera tile more
+//    room while the screenshare still dominates the layout.
 //
 // Inputs are sorted by ID before placement so the tile order is deterministic
 // across relayout calls (participants join/leave do not shuffle existing tiles).
@@ -437,8 +463,8 @@ func (c *gstCompositor) relayoutLocked() {
 		}
 		c.layoutGrid(inputs, 0, 0, W, H)
 	} else {
-		// Mixed: screenshare(s) on the left (3/4 width), cameras on the right (1/4 width).
-		mainW := W * 3 / 4
+		// Mixed: screenshare(s) on the left (70 % width), cameras on the right (30 % width).
+		mainW := W * 7 / 10
 		stripW := W - mainW
 		c.layoutGrid(screens, 0, 0, mainW, H)
 		c.layoutGrid(cameras, mainW, 0, stripW, H)
@@ -446,8 +472,10 @@ func (c *gstCompositor) relayoutLocked() {
 }
 
 // layoutGrid places len(inputs) tiles into the rectangle (xOff, yOff, w, h)
-// using the smallest square-ish grid.  Each cell is w/cols × h/rows pixels;
-// videoscale's add-borders property ensures source content is never cropped.
+// using the smallest square-ish grid.  Each cell is w/cols × h/rows pixels.
+// Camera tiles have an aspectratiocrop element that is updated here so the
+// source is center-cropped to the tile AR before scaling (crop-to-fill).
+// Screenshare tiles do not have a cropper and use letterboxing instead.
 func (c *gstCompositor) layoutGrid(inputs []*gstInput, xOff, yOff, w, h int) {
 	n := len(inputs)
 	if n == 0 {
@@ -470,6 +498,11 @@ func (c *gstCompositor) layoutGrid(inputs []*gstInput, xOff, yOff, w, h int) {
 		row := i / cols
 		xpos := xOff + col*tileW
 		ypos := yOff + row*tileH
+		if in.cropper != nil {
+			// Crop source to the tile's exact AR before scaling so the tile
+			// is always fully covered with no letterbox bars.
+			_ = in.cropper.SetProperty("aspect-ratio", gst.Fraction(tileW, tileH))
+		}
 		if in.scaler != nil {
 			_ = in.scaler.SetProperty("caps", gst.NewCapsFromString(
 				fmt.Sprintf("video/x-raw,width=%d,height=%d", tileW, tileH),
@@ -549,6 +582,7 @@ type gstInput struct {
 	src     *app.Source
 	elems   []*gst.Element
 	scaler  *gst.Element
+	cropper *gst.Element // aspectratiocrop — nil for screenshares; set during relayout
 	compPad *gst.Pad
 	closed  bool
 
