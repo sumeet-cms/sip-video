@@ -149,6 +149,12 @@ func NewCompositor(log logger.Logger, cfg Config, onSample func(Sample)) (Compos
 	if err := pipeline.SetState(gst.StatePlaying); err != nil {
 		return nil, err
 	}
+	// Record the real-world moment the pipeline enters PLAYING so that WriteRTP
+	// can derive valid GStreamer running-time PTS values even before the pipeline
+	// clock is handed to individual elements (GetClock returns nil briefly after
+	// startup with live sources, causing GST_CLOCK_TIME_NONE buffers that stall
+	// the compositor aggregator).
+	c.pipelineStartTime = time.Now()
 	log.Infow("§ GStreamer compositor pipeline started",
 		"width", cfg.Width, "height", cfg.Height, "fps", cfg.FPS, "bitrate_kbps", cfg.BitrateKbps,
 	)
@@ -167,8 +173,9 @@ type gstCompositor struct {
 	inputs map[string]*gstInput
 	closed bool
 
-	stopCh      chan struct{}
-	firstSample sync.Once
+	stopCh            chan struct{}
+	firstSample       sync.Once
+	pipelineStartTime time.Time // Go monotonic reference for PTS fallback
 }
 
 func depayDecodeFor(codec InputCodec) (depay, decoder string, err error) {
@@ -425,25 +432,39 @@ func (in *gstInput) WriteRTP(pkt []byte) error {
 	in.pktCount++
 
 	buf := gst.NewBufferFromBytes(pkt)
-	// Stamp the buffer with the pipeline's current running time.
-	// Without a PTS, the rtpjitterbuffer cannot estimate packet arrival
-	// order in the fallback (no-RTCP) path, which would stall the
-	// pipeline even with mode=NONE.
+
+	// Stamp the buffer with the pipeline running time so that the compositor
+	// aggregator can schedule frames correctly.  GST_CLOCK_TIME_NONE buffers
+	// (no PTS) cause the compositor to stall indefinitely because it cannot
+	// determine which output frame a buffer belongs to.
+	//
+	// We prefer the GStreamer pipeline clock (exact running time), but fall
+	// back to a Go monotonic elapsed time from pipeline start when the clock
+	// is not yet available — this happens for a brief window right after
+	// startup with is-live=true sources, and is exactly the window we were
+	// previously pushing NONE-timestamped buffers.
 	var ptsNs uint64
 	clockAvail := false
+	const clockNone = gst.ClockTime(^uint64(0))
 	if clock := in.comp.pipeline.GetClock(); clock != nil {
-		clockAvail = true
 		base := in.comp.pipeline.GetBaseTime()
 		now := clock.GetTime()
-		// GST_CLOCK_TIME_NONE == ^ClockTime(0); guard against it and
-		// against now < base (pipeline not yet running).
-		const clockNone = gst.ClockTime(^uint64(0))
 		if now != clockNone && base != clockNone && now >= base {
-			pts := now - base
-			ptsNs = uint64(pts)
-			buf.SetPresentationTimestamp(pts)
+			clockAvail = true
+			ptsNs = uint64(now - base)
 		}
 	}
+	if !clockAvail {
+		// Pipeline clock not yet distributed; use Go monotonic elapsed time
+		// relative to when the pipeline entered PLAYING. This produces valid,
+		// non-NONE timestamps that keep the compositor and jitterbuffer running.
+		elapsed := time.Since(in.comp.pipelineStartTime)
+		if elapsed < 0 {
+			elapsed = 0
+		}
+		ptsNs = uint64(elapsed.Nanoseconds())
+	}
+	buf.SetPresentationTimestamp(gst.ClockTime(ptsNs))
 
 	in.firstPkt.Do(func() {
 		in.comp.log.Infow("§ first RTP packet pushed to GStreamer appsrc",
