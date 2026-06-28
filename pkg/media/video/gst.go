@@ -203,6 +203,15 @@ func (c *gstCompositor) AddInput(id string, codec InputCodec, clockRate int, pay
 	)))
 
 	jitter, _ := gst.NewElement("rtpjitterbuffer")
+	// SLAVE mode (the default) waits for RTCP SR to synchronize the RTP
+	// clock before releasing any buffered packets. Because we forward only
+	// raw RTP – never RTCP SR – from the WebRTC subscriber track, the
+	// jitter buffer would stall indefinitely in SLAVE mode, producing zero
+	// decoded frames. NONE mode (0) simply reorders packets by sequence
+	// number and passes them through without any clock synchronisation.
+	_ = jitter.SetProperty("mode", 0)
+	// Bound the reorder window so out-of-order packets are not held too long.
+	_ = jitter.SetProperty("latency", uint(50))
 	depay, err := gst.NewElement(depayName)
 	if err != nil {
 		return nil, err
@@ -339,6 +348,20 @@ func (in *gstInput) WriteRTP(pkt []byte) error {
 		return nil
 	}
 	buf := gst.NewBufferFromBytes(pkt)
+	// Stamp the buffer with the pipeline's current running time.
+	// Without a PTS, the rtpjitterbuffer cannot estimate packet arrival
+	// order in the fallback (no-RTCP) path, which would stall the
+	// pipeline even with mode=NONE.
+	if clock := in.comp.pipeline.GetClock(); clock != nil {
+		base := in.comp.pipeline.GetBaseTime()
+		now := clock.GetTime()
+		// GST_CLOCK_TIME_NONE == ^ClockTime(0); guard against it and
+		// against now < base (pipeline not yet running).
+		const clockNone = gst.ClockTime(^uint64(0))
+		if now != clockNone && base != clockNone && now >= base {
+			buf.SetPresentationTimestamp(now - base)
+		}
+	}
 	if r := in.src.PushBuffer(buf); r != gst.FlowOK {
 		return fmt.Errorf("push buffer: %v", r)
 	}
