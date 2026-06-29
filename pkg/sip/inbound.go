@@ -1069,6 +1069,10 @@ func (c *inboundCall) runMediaConn(tid traceid.ID, offerData []byte, mconf *sipM
 	defer c.mmu.Unlock()
 	c.mon.SDPSize(len(offerData), true)
 	c.log().Debugw("SDP offer", "sdp", string(offerData))
+	sanitizedOfferData, cryptoLinesSanitized := sanitizeSDPCryptoSessionParams(offerData)
+	if cryptoLinesSanitized > 0 {
+		c.log().Infow("sanitized SDP crypto attributes", "count", cryptoLinesSanitized)
+	}
 
 	logSignalChanges := false
 	logSignalChanges, _ = strconv.ParseBool(featureFlags[signalLoggingFeatureFlag])
@@ -1096,14 +1100,14 @@ func (c *inboundCall) runMediaConn(tid traceid.ID, offerData []byte, mconf *sipM
 	mp.DisableOut()         // disabled until we send 200
 	mp.SetDTMFAudio(conf.AudioDTMF)
 
-	answer, mc, err := mp.SetOffer(offerData, mconf.Codecs, mconf.Encryption)
+	answer, mc, err := mp.SetOffer(sanitizedOfferData, mconf.Codecs, mconf.Encryption)
 	if err != nil {
 		return nil, err
 	}
 
 	// Negotiate an H.264 m=video line, if both sides support video.
 	if videoEnabled && mp.VideoEnabled() {
-		if err := c.setupVideo(offerData, &answer.SDP, mp, conf); err != nil {
+		if err := c.setupVideo(sanitizedOfferData, &answer.SDP, mp, conf); err != nil {
 			c.log().Warnw("video negotiation failed, continuing audio-only", err)
 		}
 	}
@@ -1134,6 +1138,33 @@ func (c *inboundCall) runMediaConn(tid traceid.ID, offerData []byte, mconf *sipM
 		info.AudioCodec = mc.Audio.Codec.Info().SDPName
 	})
 	return answerData, nil
+}
+
+// sanitizeSDPCryptoSessionParams strips trailing SRTP session params from
+// a=crypto lines (for example "UNENCRYPTED_SRTCP") because the current
+// media-sdk parser rejects them as part of the lifetime token.
+func sanitizeSDPCryptoSessionParams(offerData []byte) ([]byte, int) {
+	lines := strings.Split(string(offerData), "\n")
+	sanitized := 0
+	for i, line := range lines {
+		raw := strings.TrimSuffix(line, "\r")
+		if !strings.HasPrefix(raw, "a=crypto:") {
+			continue
+		}
+		parts := strings.Fields(raw)
+		if len(parts) <= 3 {
+			continue
+		}
+		lines[i] = strings.Join(parts[:3], " ")
+		if strings.HasSuffix(line, "\r") {
+			lines[i] += "\r"
+		}
+		sanitized++
+	}
+	if sanitized == 0 {
+		return offerData, 0
+	}
+	return []byte(strings.Join(lines, "\n")), sanitized
 }
 
 func (c *inboundCall) waitMedia(ctx context.Context) (bool, error) {
