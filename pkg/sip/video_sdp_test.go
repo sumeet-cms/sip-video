@@ -211,6 +211,49 @@ func TestSetVideoAnswerOnLocalSDPCiscoDX80(t *testing.T) {
 	assert.Contains(t, updatedStr, "max-smbps=122400")
 }
 
+// TestH264ProfileLevelIDForResolution verifies that common resolutions map to
+// the correct H.264 level strings.
+func TestH264ProfileLevelIDForResolution(t *testing.T) {
+	cases := []struct {
+		w, h     int
+		expected string
+	}{
+		{640, 480, "42e01f"},   // VGA  → Level 3.1
+		{1280, 720, "42e01f"},  // 720p → Level 3.1 (exactly 3600 MBs)
+		{1920, 1080, "42e028"}, // 1080p → Level 4.0
+		{1920, 1088, "42e028"}, // codec-aligned 1080p → Level 4.0
+		{3840, 2160, "42e032"}, // 4K → Level 5.0
+	}
+	for _, c := range cases {
+		got := h264ProfileLevelIDForResolution(c.w, c.h)
+		assert.Equal(t, c.expected, got, "resolution %dx%d", c.w, c.h)
+	}
+}
+
+// TestSetVideoAnswerLocalProfileLevelOverride verifies that when
+// LocalProfileLevelID is set (as it is in production by setupVideo / setupOutboundVideo),
+// the SDP answer carries the server's actual encoder level instead of echoing
+// the (possibly lower) level from Cisco's offer.
+func TestSetVideoAnswerLocalProfileLevelOverride(t *testing.T) {
+	v, ok := parseVideoOffer([]byte(ciscoDX80OfferSDP))
+	require.True(t, ok)
+
+	// Simulate what setupVideo does: compute the level for our 1080p encoder output.
+	v.LocalProfileLevelID = h264ProfileLevelIDForResolution(1920, 1080) // "42e028"
+
+	updated, err := setVideoAnswerOnLocalSDP([]byte(audioOnlyAnswerSDP), 19784, v)
+	require.NoError(t, err)
+
+	updatedStr := string(updated)
+	// Our level (4.0 = 42e028) must appear; Cisco's echoed level (428014) must NOT.
+	assert.Contains(t, updatedStr, "profile-level-id=42e028")
+	assert.NotContains(t, updatedStr, "profile-level-id=428014")
+	// Capacity params and packetization-mode must still be present.
+	assert.Contains(t, updatedStr, "packetization-mode=1")
+	assert.Contains(t, updatedStr, "max-mbps=122400")
+	assert.Contains(t, updatedStr, "max-fs=8160")
+}
+
 func TestParseVideoOfferRejected(t *testing.T) {
 	// port 0 means the video stream is declined
 	const rejected = `v=0

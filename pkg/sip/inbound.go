@@ -1573,6 +1573,9 @@ func (c *inboundCall) setupVideo(offerData []byte, answerSDP *pionsdp.SessionDes
 		return err
 	}
 	cfg := videoConfigFrom(conf.Video)
+	// Compute the H.264 level that our encoder will actually produce and store
+	// it so that addVideoAnswer uses our level (not Cisco's echoed level).
+	v.LocalProfileLevelID = h264ProfileLevelIDForResolution(cfg.Width, cfg.Height)
 	if err := c.lkRoom.EnableVideo(cfg, &c.stats.Video); err != nil {
 		rejectVideo(answerSDP, offered)
 		return err

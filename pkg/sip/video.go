@@ -60,8 +60,20 @@ const (
 type videoMediaConf struct {
 	Type              byte           // negotiated RTP payload type
 	ClockRate         int            // RTP clock rate (90000)
-	ProfileLevelID    string         // H.264 profile-level-id from fmtp, if any
-	PacketizationMode int            // H.264 packetization-mode from fmtp (default 1)
+	ProfileLevelID    string         // H.264 profile-level-id from remote's SDP offer/answer
+	// LocalProfileLevelID is the profile-level-id we put in OUR SDP answer.
+	// It reflects the actual H.264 level produced by our GStreamer encoder,
+	// computed from the video output config (Width × Height).  If empty,
+	// addVideoAnswer falls back to ProfileLevelID and then to the default.
+	//
+	// IMPORTANT: do NOT echo ProfileLevelID (the remote's value) in the answer.
+	// Cisco DX80 advertises profile-level-id=428014 (Level 2.0, max 352×288)
+	// even for 1080p sessions.  Echoing that back causes Cisco's hardware
+	// decoder to pre-allocate only a 352×288 buffer; when our encoder sends
+	// a 1920×1080 bitstream Cisco can decode only the top-left corner →
+	// the participant sees "half my video" or a cropped picture.
+	LocalProfileLevelID string
+	PacketizationMode   int            // H.264 packetization-mode from fmtp (default 1)
 	// H264FmtpExtra holds capacity constraints echoed from the remote offer
 	// (e.g. "max-br=2500;max-mbps=122400;max-fs=8160;max-dpb=16320;max-smbps=122400").
 	// These are appended verbatim to the fmtp line in the SDP answer so that

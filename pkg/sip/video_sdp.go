@@ -37,6 +37,31 @@ const (
 	defaultH264PacketizationMode = 1
 )
 
+// h264ProfileLevelIDForResolution returns the H.264 profile-level-id string
+// (3 bytes in lowercase hex) that matches the given encoder output resolution.
+//
+// We use Constrained Baseline Profile (0x42, 0xe0) because it is the most
+// broadly supported profile across SIP endpoints, Cisco/Tandberg, and WebRTC.
+// The level byte is chosen to match the minimum H.264 level required for the
+// given frame size at up to 30 fps so that the remote decoder pre-allocates
+// enough memory to display the full frame:
+//
+//   - Level 3.1  (0x1f / 31)  – up to 1280×720  @ 30 fps
+//   - Level 4.0  (0x28 / 40)  – up to 1920×1080 @ 30 fps
+//   - Level 5.0  (0x32 / 50)  – larger frames
+func h264ProfileLevelIDForResolution(width, height int) string {
+	// Count 16×16 macro-blocks per frame.
+	mbs := ((width + 15) / 16) * ((height + 15) / 16)
+	switch {
+	case mbs <= 3600: // ≤ 1280×720 → Level 3.1
+		return "42e01f"
+	case mbs <= 8192: // ≤ 1920×1080 → Level 4.0
+		return "42e028"
+	default: // larger → Level 5.0
+		return "42e032"
+	}
+}
+
 // addVideoOffer appends an H.264 m=video offer to s, advertising the given
 // local RTP port. The session-level connection address is reused.
 func addVideoOffer(s *sdp.SessionDescription, port int) {
@@ -65,7 +90,15 @@ func addVideoOffer(s *sdp.SessionDescription, port int) {
 // back so that Cisco/Tandberg endpoints can determine bitrate and resolution limits.
 func addVideoAnswer(s *sdp.SessionDescription, port int, v *videoMediaConf) {
 	pt := strconv.Itoa(int(v.Type))
-	profile := v.ProfileLevelID
+	// Use the LOCAL profile-level-id (derived from our encoder output resolution)
+	// in preference to the remote's offered value.  Echoing the remote value is
+	// wrong: Cisco DX80 advertises Level 2.0 (428014) even for 1080p, so if we
+	// echo it back, Cisco's decoder only allocates a 352×288 buffer and renders
+	// just the top-left corner of our full-HD frame.
+	profile := v.LocalProfileLevelID
+	if profile == "" {
+		profile = v.ProfileLevelID
+	}
 	if profile == "" {
 		profile = defaultH264ProfileLevelID
 	}

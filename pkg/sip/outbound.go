@@ -500,6 +500,9 @@ func (c *outboundCall) setupOutboundVideo(v *videoMediaConf) error {
 		return err
 	}
 	cfg := videoConfigFrom(c.c.conf.Video)
+	// Tag the conf with our encoder's actual H.264 level so that any subsequent
+	// SDP answer (e.g. re-INVITE) uses the correct profile-level-id.
+	v.LocalProfileLevelID = h264ProfileLevelIDForResolution(cfg.Width, cfg.Height)
 	if err := c.lkRoom.EnableVideo(cfg, &c.stats.Video); err != nil {
 		return err
 	}

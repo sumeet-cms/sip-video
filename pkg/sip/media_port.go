@@ -812,7 +812,13 @@ func (p *MediaPort) SetVideoConfig(v *videoMediaConf) error {
 	return nil
 }
 
+// videoPLIInterval is how often we re-request a keyframe from the remote SIP
+// endpoint.  Late-joining WebRTC subscribers miss the initial IDR; periodic
+// PLI ensures they see video within one interval.
+const videoPLIInterval = 5 * time.Second
+
 func (p *MediaPort) videoRTPLoop(sess rtp.Session, sink *h264StreamIn) {
+	pliStarted := false
 	for {
 		r, ssrc, err := sess.AcceptStream()
 		if err != nil {
@@ -826,6 +832,13 @@ func (p *MediaPort) videoRTPLoop(sess rtp.Session, sink *h264StreamIn) {
 		p.videoRemoteSSRC.Store(ssrc)
 		log := p.log.WithValues("ssrc", ssrc, "media", "video")
 		log.Infow("accepting video RTP stream")
+		// Start the periodic PLI loop once for the lifetime of this media port.
+		// videoPLILoop stops itself when p.closed fires, so we only launch it
+		// the first time a video stream is accepted (not for every new SSRC).
+		if !pliStarted {
+			pliStarted = true
+			go p.videoPLILoop(videoPLIInterval)
+		}
 		go p.videoReadStream(log, r, sink)
 	}
 }
@@ -833,14 +846,14 @@ func (p *MediaPort) videoRTPLoop(sess rtp.Session, sink *h264StreamIn) {
 // RequestVideoPLI sends an RTCP Picture Loss Indication (RFC 4585) to the
 // remote SIP endpoint, asking it to emit a fresh IDR (keyframe).
 //
-// This must be called after publishVideoTrack sets WriteVideoTo.  The initial
-// IDR from Cisco is typically received and dropped while the LiveKit room
-// connection is being established (videoOnSample is nil during that window).
-// Sending PLI triggers Cisco to emit a new IDR that the now-ready callback
-// will deliver to the LiveKit track, recovering from the all-black tile.
+// It must be called after SetVideoConfig has stored a remote address.
+// Intentionally best-effort: errors are logged by the caller, not fatal.
 //
-// RTCP is sent to remote RTP port + 1 per RFC 3550.  The function is
-// intentionally best-effort: errors are logged by the caller, not fatal.
+// NAT note: the SDP connection address is often an RFC-1918 IP unreachable from
+// the server (e.g. Cisco DX80 behind corporate NAT).  We therefore prefer
+// videoPort.GetSrc(), which is updated in real time by udpConn.Read to track
+// the actual public source address of the most recent incoming RTP packet.
+// RTCP is sent to that address on port + 1 (RFC 3550).
 func (p *MediaPort) RequestVideoPLI() error {
 	p.mu.Lock()
 	v := p.videoConf
@@ -860,9 +873,23 @@ func (p *MediaPort) RequestVideoPLI() error {
 		byte(mediaSSRC >> 24), byte(mediaSSRC >> 16), byte(mediaSSRC >> 8), byte(mediaSSRC),
 	}
 
-	// RTCP port = RTP port + 1 (unless rtcp-mux is in use, which Cisco does not advertise).
-	rtcpAddr := net.UDPAddrFromAddrPort(netip.AddrPortFrom(v.Remote.Addr(), v.Remote.Port()+1))
-	conn, err := net.DialUDP("udp", nil, rtcpAddr)
+	// Use the actual symmetric-RTP source address when available.  Cisco (and
+	// most real-world endpoints) sits behind NAT: the SDP may contain 10.x.x.x
+	// but actual RTP packets arrive from a public IP.  Sending RTCP to the
+	// private SDP address means the packet never reaches Cisco.
+	// videoPort.GetSrc() returns the real source address of the most recent
+	// incoming packet (maintained by udpConn.Read's symmetric-RTP logic).
+	rtcpIP := v.Remote.Addr()
+	rtcpPort := v.Remote.Port() + 1
+	if src, ok := p.videoPort.GetSrc(); ok {
+		rtcpIP = src.Addr()
+		rtcpPort = src.Port() + 1
+	}
+	p.log.Debugw("sending video PLI",
+		"rtcp_dst", netip.AddrPortFrom(rtcpIP, rtcpPort).String(),
+		"media_ssrc", mediaSSRC,
+	)
+	conn, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(netip.AddrPortFrom(rtcpIP, rtcpPort)))
 	if err != nil {
 		return err
 	}
@@ -870,6 +897,26 @@ func (p *MediaPort) RequestVideoPLI() error {
 	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	_, err = conn.Write(pkt[:])
 	return err
+}
+
+// videoPLILoop runs in a goroutine while video RTP is flowing and sends
+// periodic RTCP PLI to the remote endpoint every pliInterval.  This ensures
+// that late-joining WebRTC subscribers (who missed the initial IDR from Cisco)
+// get a fresh keyframe within one PLI interval without needing a full
+// PLI-forwarding chain from the WebRTC layer.
+func (p *MediaPort) videoPLILoop(pliInterval time.Duration) {
+	t := time.NewTicker(pliInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			if err := p.RequestVideoPLI(); err != nil {
+				p.log.Debugw("periodic video PLI failed", "err", err)
+			}
+		case <-p.closed.Watch():
+			return
+		}
+	}
 }
 
 func (p *MediaPort) videoReadStream(log logger.Logger, r rtp.ReadStream, sink *h264StreamIn) {
