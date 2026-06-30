@@ -14,15 +14,17 @@ write inbound RTP to disk, the **received** (mixed) video is captured with
 
 ```
 sip video testing/
-├── video_call.xml              # main scenario (IP-authenticated trunk)
-├── video_call_auth.xml         # same flow, with SIP digest auth (401/407)
-├── run_test.sh                 # one-shot: generate media → capture → call → record
-├── media/                      # generated RTP pcaps (created on first run)
-│   ├── video.pcap              #   H.264 PT 97 @ 90kHz  (the video we publish)
-│   └── audio.pcap              #   PCMU  PT 0  @ 8kHz
+├── video_call.xml                 # main scenario (IP-authenticated trunk)
+├── video_call_auth.xml            # same flow, with SIP digest auth (401/407)
+├── video_call_cisco_dx80.xml      # Cisco DX-80 / Tandberg dual-PT H264 scenario
+├── run_test.sh                    # one-shot: generate media → capture → call → record → verify
+├── media/                         # generated RTP pcaps (created on first run)
+│   ├── video.pcap                 #   H.264 PT 97  @ 90kHz (generic / video_call.xml)
+│   ├── video_pt126.pcap           #   H.264 PT 126 @ 90kHz (Cisco DX-80 scenario)
+│   └── audio.pcap                 #   PCMU  PT 0   @ 8kHz
 └── tools/
-    ├── generate_media.sh       # build the pcaps with ffmpeg (no root)
-    ├── udp_to_pcap.py          # capture ffmpeg's RTP into a pcap (no root)
+    ├── generate_media.sh          # build the pcaps with ffmpeg (no root)
+    ├── udp_to_pcap.py             # capture ffmpeg's RTP into a pcap (no root)
     └── extract_received_video.py  # depacketize received H.264 → .h264/.mp4
 ```
 
@@ -89,7 +91,78 @@ SCENARIO=video_call_auth.xml AUTH_USER=myuser AUTH_PASS=secret ./run_test.sh
 
 # capture on Wi-Fi interface en1
 CAP_IFACE=en1 ./run_test.sh
+
+# Cisco DX-80 / Tandberg dual-PT H264 scenario (see section below)
+SCENARIO=video_call_cisco_dx80.xml ./run_test.sh
 ```
+
+## Cisco DX-80 / Tandberg blank-tile scenario
+
+`video_call_cisco_dx80.xml` reproduces the exact SDP structure a **Cisco DX-80
+(CE firmware)** sends, which triggered a blank video tile bug:
+
+**The bug** — The Cisco INVITE offers two H.264 payload types:
+
+| PT  | `packetization-mode` | Capacity params |
+|-----|----------------------|-----------------|
+| 97  | `0` (single-NAL)     | `max-br=2500;max-mbps=245000;…` |
+| 126 | `1` (non-interleaved, preferred) | `max-br=2500;max-mbps=122400;…` |
+
+Without the fix, the server would pick PT 97 (first H264 found), discard all
+capacity params, and answer with just `profile-level-id` + `packetization-mode`.
+Cisco interprets the missing capacity params as "no constraints" and either
+doesn't send video or sends something the decoder can't handle → **blank tile**.
+
+**The fix** (in `pkg/sip/video_sdp.go`):
+1. `selectH264` now prefers a PT with an *explicit* `packetization-mode=1` in
+   its fmtp over one that merely defaults to it.
+2. The capacity params (`max-br`, `max-mbps`, `max-fs`, `max-dpb`, `max-smbps`)
+   are parsed from the selected PT's fmtp and stored in `videoMediaConf.H264FmtpExtra`.
+3. `addVideoAnswer` echoes them back verbatim so Cisco receives a complete answer.
+
+**Expected server answer with the fix:**
+```
+m=video <port> RTP/AVP 126
+a=rtpmap:126 H264/90000
+a=fmtp:126 profile-level-id=428014;packetization-mode=1;max-br=2500;max-mbps=122400;max-fs=8160;max-dpb=16320;max-smbps=122400
+a=rtcp-fb:126 nack pli
+a=sendrecv
+```
+
+**Running the scenario:**
+```bash
+SCENARIO=video_call_cisco_dx80.xml ./run_test.sh
+```
+
+`run_test.sh` will automatically:
+1. Generate `media/video_pt126.pcap` (PT 126 video, played back after answer).
+2. Run SIPp with `-trace_msg` to capture all SIP messages.
+3. After the call, **verify the 200 OK answer** contains PT 126 and all five
+   capacity params, printing `[PASS]` / `[FAIL]` for each:
+
+```
+== verifying Cisco DX-80 answer SDP ==
+  [PASS] server selected PT 126 (packetization-mode=1)
+  [PASS] answer contains max-br=
+  [PASS] answer contains max-mbps=
+  [PASS] answer contains max-fs=
+  [PASS] answer contains max-dpb=
+  [PASS] answer contains max-smbps=
+
+  RESULT: PASS — server answer is Cisco-compatible (blank tile fix verified)
+```
+
+The scenario uses the same SIP headers and audio SDP as `video_call.xml` so
+it hits the same auth/dispatch path.  Only the `m=video` line differs: it
+offers PT 97 (mode=0) and PT 126 (mode=1) with capacity params — the minimum
+required to reproduce and verify the blank-tile fix.
+
+> **Note on extra Cisco m-lines:** A real Cisco INVITE also contains BFCP,
+> slides-video, H224, and UDP/IX m-lines.  These are omitted from the test
+> scenario because `m=application 0 UDP/BFCP *` (with `*` as the format token)
+> can confuse pion/sdp's parser and cause the server to silently drop the INVITE
+> before responding.  The dual-PT H264 offer is the only part needed to verify
+> the fix.
 
 ## Running SIPp manually
 

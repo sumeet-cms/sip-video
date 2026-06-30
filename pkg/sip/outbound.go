@@ -509,6 +509,15 @@ func (c *outboundCall) setupOutboundVideo(v *videoMediaConf) error {
 		return err
 	}
 	c.media.WriteVideoTo(vw.WriteSample)
+	// Request a fresh IDR from the remote SIP endpoint; the initial keyframe
+	// was likely dropped while the LiveKit room connection was being set up.
+	go func() {
+		if err := c.media.RequestVideoPLI(); err != nil {
+			c.log.Debugw("initial video PLI failed", "err", err)
+		}
+		time.Sleep(time.Second)
+		_ = c.media.RequestVideoPLI()
+	}()
 	c.videoEnabled = true
 	c.log.Infow("video negotiated", "remote", v.Remote.String(), "local_port", c.media.VideoPort())
 	return nil

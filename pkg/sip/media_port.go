@@ -462,13 +462,17 @@ type MediaPort struct {
 
 	// Video (H.264) leg. Allocated only when MediaOptions.EnableVideo is set
 	// and negotiated via SetVideoConfig.
-	videoPort     *udpConn
-	videoSess     rtp.Session
-	videoConf     *videoMediaConf
-	videoOut      *gatedVideoWriter // LK H.264 sample -> SIP RTP
-	videoSink     *h264StreamIn     // SIP RTP -> LK H.264 sample
-	videoOnSample atomic.Pointer[func(media.Sample) error]
-	videoStats    *VideoStats
+	videoPort       *udpConn
+	videoSess       rtp.Session
+	videoConf       *videoMediaConf
+	videoOut        *gatedVideoWriter  // LK H.264 sample -> SIP RTP
+	videoSink       *h264StreamIn      // SIP RTP -> LK H.264 sample
+	videoOnSample   atomic.Pointer[func(media.Sample) error]
+	videoStats      *VideoStats
+	// SSRC of the remote video sender (Cisco/SIP endpoint).  Populated by
+	// videoRTPLoop once the first RTP stream is accepted; used by
+	// RequestVideoPLI to address the RTCP feedback packet correctly.
+	videoRemoteSSRC atomic.Uint32
 }
 
 func (p *MediaPort) DisableOut() {
@@ -818,10 +822,54 @@ func (p *MediaPort) videoRTPLoop(sess rtp.Session, sink *h264StreamIn) {
 			return
 		}
 		p.mediaReceived.Break()
+		// Remember Cisco's SSRC so RequestVideoPLI can address the packet.
+		p.videoRemoteSSRC.Store(ssrc)
 		log := p.log.WithValues("ssrc", ssrc, "media", "video")
 		log.Infow("accepting video RTP stream")
 		go p.videoReadStream(log, r, sink)
 	}
+}
+
+// RequestVideoPLI sends an RTCP Picture Loss Indication (RFC 4585) to the
+// remote SIP endpoint, asking it to emit a fresh IDR (keyframe).
+//
+// This must be called after publishVideoTrack sets WriteVideoTo.  The initial
+// IDR from Cisco is typically received and dropped while the LiveKit room
+// connection is being established (videoOnSample is nil during that window).
+// Sending PLI triggers Cisco to emit a new IDR that the now-ready callback
+// will deliver to the LiveKit track, recovering from the all-black tile.
+//
+// RTCP is sent to remote RTP port + 1 per RFC 3550.  The function is
+// intentionally best-effort: errors are logged by the caller, not fatal.
+func (p *MediaPort) RequestVideoPLI() error {
+	p.mu.Lock()
+	v := p.videoConf
+	p.mu.Unlock()
+	if v == nil {
+		return nil
+	}
+	mediaSSRC := p.videoRemoteSSRC.Load()
+
+	// RTCP PLI (RFC 4585 §6.3.1): fixed 12 bytes.
+	//   V=2, P=0, FMT=1 (PLI), PT=206 (PSFB), Length=2 (three 32-bit words)
+	//   Sender SSRC: 0 (we have no outbound SSRC for RTCP)
+	//   Media SSRC:  remote sender's SSRC
+	pkt := [12]byte{
+		0x81, 0xce, 0x00, 0x02,
+		0x00, 0x00, 0x00, 0x00,
+		byte(mediaSSRC >> 24), byte(mediaSSRC >> 16), byte(mediaSSRC >> 8), byte(mediaSSRC),
+	}
+
+	// RTCP port = RTP port + 1 (unless rtcp-mux is in use, which Cisco does not advertise).
+	rtcpAddr := net.UDPAddrFromAddrPort(netip.AddrPortFrom(v.Remote.Addr(), v.Remote.Port()+1))
+	conn, err := net.DialUDP("udp", nil, rtcpAddr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_, err = conn.Write(pkt[:])
+	return err
 }
 
 func (p *MediaPort) videoReadStream(log logger.Logger, r rtp.ReadStream, sink *h264StreamIn) {

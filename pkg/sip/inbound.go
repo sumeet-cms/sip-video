@@ -1533,6 +1533,20 @@ func (c *inboundCall) publishVideoTrack() error {
 		return err
 	}
 	c.media.WriteVideoTo(vw.WriteSample)
+	// The LiveKit track callback is now live.  The initial IDR from Cisco was
+	// almost certainly dropped while we were joining the room (videoOnSample was
+	// nil during that window).  Request a fresh keyframe so Cisco re-emits an
+	// IDR that the decoder can actually use.  A second PLI fires 1 s later in
+	// case Cisco needs extra time to respond (e.g. encoder not yet started).
+	go func() {
+		if err := c.media.RequestVideoPLI(); err != nil {
+			c.log().Debugw("initial video PLI failed", "err", err)
+		}
+		time.Sleep(time.Second)
+		if err := c.media.RequestVideoPLI(); err != nil {
+			c.log().Debugw("follow-up video PLI failed", "err", err)
+		}
+	}()
 	return nil
 }
 
