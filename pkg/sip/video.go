@@ -62,6 +62,11 @@ type videoMediaConf struct {
 	ClockRate         int            // RTP clock rate (90000)
 	ProfileLevelID    string         // H.264 profile-level-id from fmtp, if any
 	PacketizationMode int            // H.264 packetization-mode from fmtp (default 1)
+	// H264FmtpExtra holds capacity constraints echoed from the remote offer
+	// (e.g. "max-br=2500;max-mbps=122400;max-fs=8160;max-dpb=16320;max-smbps=122400").
+	// These are appended verbatim to the fmtp line in the SDP answer so that
+	// Cisco/Tandberg endpoints know the bitrate/resolution limits they should honour.
+	H264FmtpExtra     string
 	Local             netip.AddrPort // our local video RTP address
 	Remote            netip.AddrPort // remote video RTP address
 }

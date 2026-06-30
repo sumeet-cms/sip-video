@@ -119,11 +119,17 @@ a=rtpmap:0 PCMU/8000
 func TestParseVideoOfferCiscoComplex(t *testing.T) {
 	v, ok := parseVideoOffer([]byte(ciscoComplexOfferSDP))
 	require.True(t, ok)
-	assert.Equal(t, byte(97), v.Type)
+	// PT 116 has explicit packetization-mode=1 and is preferred over PT 97.
+	assert.Equal(t, byte(116), v.Type)
 	assert.Equal(t, VideoClockRate, v.ClockRate)
 	assert.Equal(t, "428014", v.ProfileLevelID)
 	assert.Equal(t, 1, v.PacketizationMode)
 	assert.Equal(t, "164.100.103.40:45316", v.Remote.String())
+	// Capacity params from PT 116's fmtp must be preserved for the answer.
+	assert.Contains(t, v.H264FmtpExtra, "max-mbps=489600")
+	assert.Contains(t, v.H264FmtpExtra, "max-fs=8160")
+	assert.Contains(t, v.H264FmtpExtra, "max-br=3120")
+	assert.Contains(t, v.H264FmtpExtra, "max-dpb=4752")
 }
 
 func TestSetVideoAnswerOnLocalSDP(t *testing.T) {
@@ -135,10 +141,74 @@ func TestSetVideoAnswerOnLocalSDP(t *testing.T) {
 
 	parsed, ok := parseVideoOffer(updated)
 	require.True(t, ok)
-	assert.Equal(t, byte(97), parsed.Type)
+	assert.Equal(t, byte(116), parsed.Type)
 	assert.Equal(t, "428014", parsed.ProfileLevelID)
 	assert.Equal(t, 1, parsed.PacketizationMode)
 	assert.Equal(t, "135.235.161.185:13645", parsed.Remote.String())
+
+	// Capacity params must be echoed verbatim in the answer fmtp.
+	assert.Contains(t, string(updated), "max-mbps=489600")
+	assert.Contains(t, string(updated), "max-fs=8160")
+	assert.Contains(t, string(updated), "max-br=3120")
+}
+
+// ciscoDX80OfferSDP reflects a real Cisco DX-80 INVITE where PT 97 is
+// packetization-mode=0 and PT 126 is packetization-mode=1.  The server must
+// prefer PT 126 and echo its capacity params back in the answer.
+const ciscoDX80OfferSDP = `v=0
+o=tandberg 15 1 IN IP4 10.1.2.5
+s=-
+c=IN IP4 10.1.2.5
+t=0 0
+m=audio 2336 RTP/AVP 9 0 8 101
+a=rtpmap:9 G722/8000
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=sendrecv
+m=video 2372 RTP/AVP 97 126
+a=rtpmap:97 H264/90000
+a=fmtp:97 packetization-mode=0;profile-level-id=428014;max-br=2500;max-mbps=245000;max-fs=8160;max-dpb=16320;max-smbps=245000
+a=rtpmap:126 H264/90000
+a=fmtp:126 packetization-mode=1;profile-level-id=428014;max-br=2500;max-mbps=122400;max-fs=8160;max-dpb=16320;max-smbps=122400
+a=rtcp-fb:* nack pli
+a=sendrecv
+`
+
+func TestParseVideoOfferCiscoDX80(t *testing.T) {
+	v, ok := parseVideoOffer([]byte(ciscoDX80OfferSDP))
+	require.True(t, ok)
+	// PT 97 is mode=0; PT 126 is mode=1 — we must prefer PT 126.
+	assert.Equal(t, byte(126), v.Type)
+	assert.Equal(t, VideoClockRate, v.ClockRate)
+	assert.Equal(t, "428014", v.ProfileLevelID)
+	assert.Equal(t, 1, v.PacketizationMode)
+	assert.Equal(t, "10.1.2.5:2372", v.Remote.String())
+	// Capacity params from PT 126's fmtp.
+	assert.Contains(t, v.H264FmtpExtra, "max-br=2500")
+	assert.Contains(t, v.H264FmtpExtra, "max-mbps=122400")
+	assert.Contains(t, v.H264FmtpExtra, "max-fs=8160")
+	assert.Contains(t, v.H264FmtpExtra, "max-dpb=16320")
+	assert.Contains(t, v.H264FmtpExtra, "max-smbps=122400")
+}
+
+func TestSetVideoAnswerOnLocalSDPCiscoDX80(t *testing.T) {
+	v, ok := parseVideoOffer([]byte(ciscoDX80OfferSDP))
+	require.True(t, ok)
+
+	updated, err := setVideoAnswerOnLocalSDP([]byte(audioOnlyAnswerSDP), 19784, v)
+	require.NoError(t, err)
+
+	// The answer must echo all capacity params so Cisco doesn't show a blank tile.
+	updatedStr := string(updated)
+	assert.Contains(t, updatedStr, "profile-level-id=428014")
+	assert.Contains(t, updatedStr, "packetization-mode=1")
+	assert.Contains(t, updatedStr, "max-br=2500")
+	assert.Contains(t, updatedStr, "max-mbps=122400")
+	assert.Contains(t, updatedStr, "max-fs=8160")
+	assert.Contains(t, updatedStr, "max-dpb=16320")
+	assert.Contains(t, updatedStr, "max-smbps=122400")
 }
 
 func TestParseVideoOfferRejected(t *testing.T) {

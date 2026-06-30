@@ -61,6 +61,8 @@ func addVideoOffer(s *sdp.SessionDescription, port int) {
 
 // addVideoAnswer appends an H.264 m=video answer to s using the negotiated
 // payload type and profile, advertising the given local RTP port.
+// Capacity constraints parsed from the remote offer (H264FmtpExtra) are echoed
+// back so that Cisco/Tandberg endpoints can determine bitrate and resolution limits.
 func addVideoAnswer(s *sdp.SessionDescription, port int, v *videoMediaConf) {
 	pt := strconv.Itoa(int(v.Type))
 	profile := v.ProfileLevelID
@@ -71,6 +73,10 @@ func addVideoAnswer(s *sdp.SessionDescription, port int, v *videoMediaConf) {
 	if pktMode == 0 {
 		pktMode = defaultH264PacketizationMode
 	}
+	fmtp := fmt.Sprintf("%s profile-level-id=%s;packetization-mode=%d", pt, profile, pktMode)
+	if v.H264FmtpExtra != "" {
+		fmtp += ";" + v.H264FmtpExtra
+	}
 	md := &sdp.MediaDescription{
 		MediaName: sdp.MediaName{
 			Media:   "video",
@@ -80,7 +86,7 @@ func addVideoAnswer(s *sdp.SessionDescription, port int, v *videoMediaConf) {
 		},
 		Attributes: []sdp.Attribute{
 			{Key: "rtpmap", Value: fmt.Sprintf("%s %s/%d", pt, h264SDPName, VideoClockRate)},
-			{Key: "fmtp", Value: fmt.Sprintf("%s profile-level-id=%s;packetization-mode=%d", pt, profile, pktMode)},
+			{Key: "fmtp", Value: fmtp},
 			{Key: "rtcp-fb", Value: pt + " nack pli"},
 			{Key: "sendrecv"},
 		},
@@ -146,7 +152,7 @@ func parseVideoSession(s *sdp.SessionDescription) (*videoMediaConf, bool) {
 	if md == nil || md.MediaName.Port.Value == 0 {
 		return nil, false
 	}
-	pt, profile, pktMode, ok := selectH264(md)
+	pt, profile, pktMode, extra, ok := selectH264(md)
 	if !ok {
 		return nil, false
 	}
@@ -159,19 +165,45 @@ func parseVideoSession(s *sdp.SessionDescription) (*videoMediaConf, bool) {
 		ClockRate:         VideoClockRate,
 		ProfileLevelID:    profile,
 		PacketizationMode: pktMode,
+		H264FmtpExtra:     extra,
 		Remote:            addr,
 	}, true
 }
 
-// selectH264 finds the H.264 payload type and its fmtp parameters in md.
-func selectH264(md *sdp.MediaDescription) (pt byte, profileLevelID string, packetizationMode int, ok bool) {
-	packetizationMode = defaultH264PacketizationMode
-	var h264PT = -1
+// h264CapacityParams is the set of H.264 fmtp capacity parameters that are
+// echoed back verbatim in the SDP answer so that Cisco/Tandberg endpoints can
+// determine the bitrate and resolution limits they should apply.
+var h264CapacityParams = map[string]struct{}{
+	"max-br":    {},
+	"max-mbps":  {},
+	"max-fs":    {},
+	"max-dpb":   {},
+	"max-smbps": {},
+	"max-cpb":   {},
+	"max-fps":   {},
+}
+
+// selectH264 finds the best H.264 payload type and its fmtp parameters in md.
+// It prefers a PT with explicit packetization-mode=1 (RFC 6184 non-interleaved)
+// when multiple H.264 entries are offered, falling back to the first H.264 PT.
+// It also collects H.264 capacity parameters (max-br, max-mbps, …) so they can
+// be echoed in the SDP answer.
+func selectH264(md *sdp.MediaDescription) (pt byte, profileLevelID string, packetizationMode int, fmtpExtra string, ok bool) {
+	type candidate struct {
+		pt                    int
+		profileLevelID        string
+		packetizationMode     int
+		packetModeExplicit    bool   // true when packetization-mode appeared in fmtp
+		extra                 string // semicolon-joined capacity params
+	}
+
+	// First pass: collect all H.264 PTs in offer order.
+	var candidates []candidate
+	ptIndex := make(map[string]int) // pt string → index into candidates
 	for _, a := range md.Attributes {
 		if a.Key != "rtpmap" {
 			continue
 		}
-		// "<pt> H264/90000"
 		fields := strings.SplitN(a.Value, " ", 2)
 		if len(fields) != 2 {
 			continue
@@ -180,42 +212,76 @@ func selectH264(md *sdp.MediaDescription) (pt byte, profileLevelID string, packe
 		if i := strings.IndexByte(name, '/'); i >= 0 {
 			name = name[:i]
 		}
-		if strings.EqualFold(name, h264SDPName) {
-			if v, err := strconv.Atoi(strings.TrimSpace(fields[0])); err == nil {
-				h264PT = v
-				break
-			}
+		if !strings.EqualFold(name, h264SDPName) {
+			continue
 		}
+		v, err := strconv.Atoi(strings.TrimSpace(fields[0]))
+		if err != nil {
+			continue
+		}
+		ptIndex[strconv.Itoa(v)] = len(candidates)
+		candidates = append(candidates, candidate{
+			pt:                v,
+			packetizationMode: defaultH264PacketizationMode,
+		})
 	}
-	if h264PT < 0 {
-		return 0, "", 0, false
+	if len(candidates) == 0 {
+		return 0, "", 0, "", false
 	}
-	ptStr := strconv.Itoa(h264PT)
+
+	// Second pass: parse fmtp for each H.264 PT.
 	for _, a := range md.Attributes {
 		if a.Key != "fmtp" {
 			continue
 		}
 		fields := strings.SplitN(a.Value, " ", 2)
-		if len(fields) != 2 || strings.TrimSpace(fields[0]) != ptStr {
+		if len(fields) != 2 {
 			continue
 		}
+		idx, found := ptIndex[strings.TrimSpace(fields[0])]
+		if !found {
+			continue
+		}
+		var extraParts []string
 		for _, kv := range strings.Split(fields[1], ";") {
 			kv = strings.TrimSpace(kv)
-			k, v, found := strings.Cut(kv, "=")
-			if !found {
+			k, v, hasSep := strings.Cut(kv, "=")
+			if !hasSep {
 				continue
 			}
-			switch strings.ToLower(strings.TrimSpace(k)) {
+			k = strings.ToLower(strings.TrimSpace(k))
+			v = strings.TrimSpace(v)
+			switch k {
 			case "profile-level-id":
-				profileLevelID = strings.TrimSpace(v)
+				candidates[idx].profileLevelID = v
 			case "packetization-mode":
-				if m, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
-					packetizationMode = m
+				if m, err := strconv.Atoi(v); err == nil {
+					candidates[idx].packetizationMode = m
+					candidates[idx].packetModeExplicit = true
+				}
+			default:
+				if _, isCapacity := h264CapacityParams[k]; isCapacity {
+					extraParts = append(extraParts, k+"="+v)
 				}
 			}
 		}
+		candidates[idx].extra = strings.Join(extraParts, ";")
 	}
-	return byte(h264PT), profileLevelID, packetizationMode, true
+
+	// Select the best candidate: prefer a PT that explicitly declares
+	// packetization-mode=1 in its fmtp over one that only has the default.
+	// This ensures Cisco endpoints that list both mode=0 (PT 97) and mode=1
+	// (PT 126) get the mode=1 PT selected, while still falling back gracefully.
+	selected := candidates[0]
+	for _, c := range candidates[1:] {
+		selectedIsExplicit1 := selected.packetModeExplicit && selected.packetizationMode == 1
+		cIsExplicit1 := c.packetModeExplicit && c.packetizationMode == 1
+		if cIsExplicit1 && !selectedIsExplicit1 {
+			selected = c
+		}
+	}
+
+	return byte(selected.pt), selected.profileLevelID, selected.packetizationMode, selected.extra, true
 }
 
 // videoRemoteAddr resolves the remote RTP address for the video m-line,
