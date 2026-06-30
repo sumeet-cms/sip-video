@@ -2110,10 +2110,20 @@ func (c *sipInbound) AcceptBye(req *sip.Request, tx sip.ServerTransaction) {
 }
 
 func (c *sipInbound) swapSrcDst(req *sip.Request) {
+	// Use the established connection's destination as the transport target.
+	// For NAT traversal (e.g. Cisco behind corporate NAT), the Contact header
+	// in the INVITE contains the private/internal IP (e.g. 10.1.2.27) while
+	// the actual TLS connection arrived from the public IP (e.g. 164.100.206.129).
+	// c.inviteOk.Destination() holds the address of that established connection,
+	// which is the only reachable path back to the remote.  Overriding it from
+	// the Contact URI causes the transport layer to dial a new connection to the
+	// unreachable private IP, silently dropping the outbound SIP INFO message.
 	dest := c.inviteOk.Destination()
 	if contact := c.invite.Contact(); contact != nil {
 		req.Recipient = contact.Address
-		dest = ConvertURI(&contact.Address).GetDest()
+		// Do NOT derive dest from contact.Address here – for NAT scenarios the
+		// Contact contains a private IP that is unreachable from this server.
+		// The transport-layer destination stays as the existing connection address.
 	} else {
 		req.Recipient = c.from.Address
 	}
