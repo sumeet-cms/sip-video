@@ -273,11 +273,13 @@ func newH264StreamIn(clockRate int, onSample func(media.Sample), stats *VideoSta
 
 func (h *h264StreamIn) String() string { return "H264Depay" }
 
-// isH264Keyframe returns true if the Annex-B or raw NALU data starts with an
-// IDR NALU (type 5).  This is a best-effort check for diagnostic logging only.
+// isH264Keyframe returns true if the Annex-B access unit contains an IDR NALU
+// (type 5).  Encoders typically prepend SPS (type 7) and PPS (type 8) NALUs
+// before the IDR on every keyframe; this function skips those so the IDR is
+// not missed.  This is a best-effort check for diagnostic logging only.
 func isH264Keyframe(data []byte) bool {
-	// Skip up to two Annex-B start codes (3-byte or 4-byte) to reach the first NALU.
-	for i := 0; i < 2; i++ {
+	for len(data) > 0 {
+		// Strip the Annex-B start code (0x000001 or 0x00000001).
 		if len(data) >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1 {
 			data = data[4:]
 		} else if len(data) >= 3 && data[0] == 0 && data[1] == 0 && data[2] == 1 {
@@ -285,11 +287,31 @@ func isH264Keyframe(data []byte) bool {
 		} else {
 			break
 		}
+		if len(data) == 0 {
+			break
+		}
+		naluType := data[0] & 0x1f
+		switch naluType {
+		case 5: // IDR — this is a keyframe
+			return true
+		case 6, 7, 8: // SEI, SPS, PPS — skip and continue to the next NALU
+			// Advance past this NALU by finding the next start code.
+			next := -1
+			for i := 1; i+2 < len(data); i++ {
+				if data[i] == 0 && data[i+1] == 0 && data[i+2] == 1 {
+					next = i
+					break
+				}
+			}
+			if next < 0 {
+				return false
+			}
+			data = data[next:]
+		default:
+			return false
+		}
 	}
-	if len(data) == 0 {
-		return false
-	}
-	return data[0]&0x1f == 5 // NALU type 5 = IDR
+	return false
 }
 
 func (h *h264StreamIn) HandleRTP(hdr *prtp.Header, payload []byte) error {

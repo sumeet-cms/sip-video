@@ -1770,15 +1770,16 @@ func (s *Server) newInbound(invite *sip.Request, inviteTx sip.ServerTransaction,
 		"direction", "inbound",
 	)
 	c := &sipInbound{
-		s:         s,
-		id:        LocalTag(toTag),
-		invite:    invite,
-		inviteTx:  inviteTx,
-		to:        toHdr,
-		from:      fromHdr,
-		tag:       RemoteTag(fromTag),
-		sipCallID: sipCallID,
-		legTr:     legTr,
+		s:          s,
+		id:         LocalTag(toTag),
+		invite:     invite,
+		inviteTx:   inviteTx,
+		to:         toHdr,
+		from:       fromHdr,
+		tag:        RemoteTag(fromTag),
+		sipCallID:  sipCallID,
+		legTr:      legTr,
+		inviteAddr: src,
 		contact: &sip.ContactHeader{
 			Address: *contact.GetContactURI(),
 		},
@@ -1810,6 +1811,11 @@ type sipInbound struct {
 	to         *sip.ToHeader
 	legTr      Transport
 	referDone  chan error
+	// inviteAddr is the actual transport-layer remote address of the TLS/TCP
+	// connection that carried the initial INVITE.  For endpoints behind NAT
+	// (e.g. Cisco Tandberg) the Via header contains the private IP while this
+	// field holds the reachable public address used for outbound SIP requests.
+	inviteAddr netip.AddrPort
 
 	mu              sync.RWMutex
 	lastSDP         []byte
@@ -2110,15 +2116,22 @@ func (c *sipInbound) AcceptBye(req *sip.Request, tx sip.ServerTransaction) {
 }
 
 func (c *sipInbound) swapSrcDst(req *sip.Request) {
-	// Use the original INVITE's network source as the transport target.
-	// For NAT traversal (e.g. Cisco behind corporate NAT), c.inviteOk.Destination()
-	// returns the Via address from the INVITE (e.g. private 10.1.2.27:59968) which
-	// is unreachable from this server.  The only reachable path is the actual TLS
-	// connection that carried the INVITE, whose remote address is stored in
-	// c.invite.Source() (e.g. public 164.100.206.129:59968).  Using that ensures
-	// the SIP stack reuses the existing connection rather than attempting (and
-	// failing) to dial a new one to the private IP.
-	dest := c.invite.Source()
+	// Use the transport-layer address captured when the INVITE arrived as the
+	// destination for outbound SIP requests (SIP INFO, BYE, etc.).
+	//
+	// For endpoints behind corporate NAT (e.g. Cisco Tandberg) the Via header
+	// inside the INVITE carries the private IP (e.g. 10.1.2.27:59968) which is
+	// unreachable from this server.  c.invite.Source() and
+	// c.inviteOk.Destination() both derive their value from that Via header and
+	// therefore also return the private IP.
+	//
+	// c.inviteAddr is set from the raw req.Source() at the moment the INVITE
+	// handler first runs — before the SIP library can overwrite the field —
+	// and holds the actual TCP/TLS connection remote address (e.g. public
+	// 164.100.206.129:59968).  Using it guarantees the SIP stack reuses the
+	// existing connection rather than attempting (and failing) to dial the
+	// private IP.
+	dest := c.inviteAddr.String()
 	if contact := c.invite.Contact(); contact != nil {
 		req.Recipient = contact.Address
 		// Do NOT derive dest from contact.Address here – for NAT scenarios the
