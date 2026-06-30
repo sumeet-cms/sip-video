@@ -28,6 +28,7 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media/samplebuilder"
 
 	msdkrtp "github.com/livekit/media-sdk/rtp"
+	"github.com/livekit/protocol/logger"
 
 	"github.com/livekit/sip/pkg/config"
 	"github.com/livekit/sip/pkg/media/video"
@@ -250,13 +251,15 @@ func (h *h264RTPWriter) WriteVideoSample(s video.Sample) error {
 // h264StreamIn depacketizes inbound SIP H.264 RTP into access units and
 // forwards them to onSample (typically a LiveKit video track writer).
 type h264StreamIn struct {
-	mu       sync.Mutex
-	sb       *samplebuilder.SampleBuilder
-	onSample func(media.Sample)
-	stats    *VideoStats
+	mu         sync.Mutex
+	sb         *samplebuilder.SampleBuilder
+	onSample   func(media.Sample)
+	stats      *VideoStats
+	log        logger.Logger
+	frameCount uint64
 }
 
-func newH264StreamIn(clockRate int, onSample func(media.Sample), stats *VideoStats) *h264StreamIn {
+func newH264StreamIn(clockRate int, onSample func(media.Sample), stats *VideoStats, log logger.Logger) *h264StreamIn {
 	if clockRate <= 0 {
 		clockRate = VideoClockRate
 	}
@@ -264,10 +267,30 @@ func newH264StreamIn(clockRate int, onSample func(media.Sample), stats *VideoSta
 		sb:       samplebuilder.New(videoSampleBufferMaxLate, &codecs.H264Packet{}, uint32(clockRate)),
 		onSample: onSample,
 		stats:    stats,
+		log:      log,
 	}
 }
 
 func (h *h264StreamIn) String() string { return "H264Depay" }
+
+// isH264Keyframe returns true if the Annex-B or raw NALU data starts with an
+// IDR NALU (type 5).  This is a best-effort check for diagnostic logging only.
+func isH264Keyframe(data []byte) bool {
+	// Skip up to two Annex-B start codes (3-byte or 4-byte) to reach the first NALU.
+	for i := 0; i < 2; i++ {
+		if len(data) >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1 {
+			data = data[4:]
+		} else if len(data) >= 3 && data[0] == 0 && data[1] == 0 && data[2] == 1 {
+			data = data[3:]
+		} else {
+			break
+		}
+	}
+	if len(data) == 0 {
+		return false
+	}
+	return data[0]&0x1f == 5 // NALU type 5 = IDR
+}
 
 func (h *h264StreamIn) HandleRTP(hdr *prtp.Header, payload []byte) error {
 	if h.stats != nil {
@@ -284,12 +307,30 @@ func (h *h264StreamIn) HandleRTP(hdr *prtp.Header, payload []byte) error {
 		if s == nil {
 			break
 		}
+		h.frameCount++
+		keyframe := isH264Keyframe(s.Data)
 		if h.stats != nil {
 			h.stats.InFrames.Add(1)
 		}
-		if h.onSample != nil {
-			h.onSample(*s)
+		// Log the first 3 frames, every 150 frames, and every keyframe so we
+		// can confirm assembly is working and PLIs are triggering IDR responses.
+		if h.log != nil && (h.frameCount <= 3 || h.frameCount%150 == 0 || keyframe) {
+			h.log.Infow("video frame assembled from RTP",
+				"frame_count", h.frameCount,
+				"frame_size", len(s.Data),
+				"keyframe", keyframe,
+				"duration", s.Duration,
+				"dropped_pkts", s.PrevDroppedPackets,
+			)
 		}
+		if h.onSample == nil {
+			if h.log != nil {
+				h.log.Warnw("video frame assembled but onSample is nil — frame dropped",
+					nil, "frame_count", h.frameCount, "keyframe", keyframe)
+			}
+			continue
+		}
+		h.onSample(*s)
 	}
 	return nil
 }

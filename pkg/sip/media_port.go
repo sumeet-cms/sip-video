@@ -467,8 +467,12 @@ type MediaPort struct {
 	videoConf       *videoMediaConf
 	videoOut        *gatedVideoWriter  // LK H.264 sample -> SIP RTP
 	videoSink       *h264StreamIn      // SIP RTP -> LK H.264 sample
-	videoOnSample   atomic.Pointer[func(media.Sample) error]
-	videoStats      *VideoStats
+	videoOnSample           atomic.Pointer[func(media.Sample) error]
+	// onVideoKeyframeRequest, if set, is called every videoPLIInterval instead
+	// of plain RTCP PLI.  inboundCall sets this to also send a SIP INFO picture
+	// fast update (RFC 5168), which is more reliable for Cisco behind NAT.
+	onVideoKeyframeRequest  atomic.Pointer[func()]
+	videoStats              *VideoStats
 	// SSRC of the remote video sender (Cisco/SIP endpoint).  Populated by
 	// videoRTPLoop once the first RTP stream is accepted; used by
 	// RequestVideoPLI to address the RTCP feedback packet correctly.
@@ -769,6 +773,16 @@ func (p *MediaPort) WriteVideoTo(onSample func(media.Sample) error) {
 	p.videoOnSample.Store(&onSample)
 }
 
+// SetVideoKeyframeCallback registers the function that is called each time a
+// keyframe should be requested from the remote SIP endpoint.  The callback
+// should send both a SIP INFO picture fast update (RFC 5168) and an RTCP PLI
+// so that endpoints behind NAT are covered regardless of which path works.
+// Must be called before the first RTP packet arrives for the periodic loop to
+// pick it up; for inbound calls, call this right after SetVideoConfig.
+func (p *MediaPort) SetVideoKeyframeCallback(fn func()) {
+	p.onVideoKeyframeRequest.Store(&fn)
+}
+
 // SetVideoConfig applies the negotiated video parameters: it creates the video
 // RTP session, the outbound packetizer and the inbound depacketizer, and starts
 // reading video RTP. It is a no-op if video was not enabled on this port.
@@ -803,11 +817,19 @@ func (p *MediaPort) SetVideoConfig(v *videoMediaConf) error {
 	p.videoOut.Swap(out)
 
 	// Inbound: RTP -> H.264 access units -> registered callback.
+	// The closure logs frames that arrive before WriteVideoTo is called so we
+	// can confirm whether the initial IDR is being dropped during room join.
+	portLog := p.log
 	p.videoSink = newH264StreamIn(v.ClockRate, func(s media.Sample) {
-		if cb := p.videoOnSample.Load(); cb != nil && *cb != nil {
-			_ = (*cb)(s)
+		cb := p.videoOnSample.Load()
+		if cb == nil || *cb == nil {
+			portLog.Warnw("inbound video frame has no LiveKit callback yet — frame dropped (call WriteVideoTo first)",
+				nil, "frame_size", len(s.Data), "keyframe", isH264Keyframe(s.Data),
+			)
+			return
 		}
-	}, p.videoStats)
+		_ = (*cb)(s)
+	}, p.videoStats, portLog.WithValues("component", "h264-depacketizer"))
 	go p.videoRTPLoop(sess, p.videoSink)
 	return nil
 }
@@ -832,12 +854,22 @@ func (p *MediaPort) videoRTPLoop(sess rtp.Session, sink *h264StreamIn) {
 		p.videoRemoteSSRC.Store(ssrc)
 		log := p.log.WithValues("ssrc", ssrc, "media", "video")
 		log.Infow("accepting video RTP stream")
-		// Start the periodic PLI loop once for the lifetime of this media port.
-		// videoPLILoop stops itself when p.closed fires, so we only launch it
-		// the first time a video stream is accepted (not for every new SSRC).
+		// Start the periodic keyframe request loop once for the lifetime of
+		// this media port.  The caller must set OnVideoKeyframeRequest to
+		// include SIP INFO in addition to RTCP PLI.
 		if !pliStarted {
 			pliStarted = true
-			go p.videoPLILoop(videoPLIInterval)
+			cb := p.onVideoKeyframeRequest.Load()
+			if cb == nil || *cb == nil {
+				// Fallback: RTCP PLI only (no SIP INFO available).
+				go p.videoPLILoop(videoPLIInterval, func() {
+					if err := p.RequestVideoPLI(); err != nil {
+						p.log.Warnw("periodic RTCP PLI failed", err)
+					}
+				})
+			} else {
+				go p.videoPLILoop(videoPLIInterval, *cb)
+			}
 		}
 		go p.videoReadStream(log, r, sink)
 	}
@@ -885,9 +917,11 @@ func (p *MediaPort) RequestVideoPLI() error {
 		rtcpIP = src.Addr()
 		rtcpPort = src.Port() + 1
 	}
-	p.log.Debugw("sending video PLI",
+	p.log.Infow("sending video PLI (RTCP keyframe request)",
 		"rtcp_dst", netip.AddrPortFrom(rtcpIP, rtcpPort).String(),
 		"media_ssrc", mediaSSRC,
+		"sdp_addr", v.Remote.String(),
+		"using_symmetric_src", p.videoPort != nil,
 	)
 	conn, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(netip.AddrPortFrom(rtcpIP, rtcpPort)))
 	if err != nil {
@@ -899,21 +933,21 @@ func (p *MediaPort) RequestVideoPLI() error {
 	return err
 }
 
-// videoPLILoop runs in a goroutine while video RTP is flowing and sends
-// periodic RTCP PLI to the remote endpoint every pliInterval.  This ensures
-// that late-joining WebRTC subscribers (who missed the initial IDR from Cisco)
-// get a fresh keyframe within one PLI interval without needing a full
-// PLI-forwarding chain from the WebRTC layer.
-func (p *MediaPort) videoPLILoop(pliInterval time.Duration) {
+// videoPLILoop runs in a goroutine while video RTP is flowing and calls
+// onKeyframeRequest every pliInterval.  The callback is expected to send both
+// an RTCP PLI and a SIP INFO picture fast update so that Cisco endpoints behind
+// NAT (where RTCP UDP may be blocked) still receive the keyframe request.
+func (p *MediaPort) videoPLILoop(pliInterval time.Duration, onKeyframeRequest func()) {
+	p.log.Infow("starting periodic keyframe request loop", "interval", pliInterval)
 	t := time.NewTicker(pliInterval)
 	defer t.Stop()
 	for {
 		select {
 		case <-t.C:
-			if err := p.RequestVideoPLI(); err != nil {
-				p.log.Debugw("periodic video PLI failed", "err", err)
-			}
+			p.log.Infow("periodic keyframe request firing")
+			onKeyframeRequest()
 		case <-p.closed.Watch():
+			p.log.Infow("stopping periodic keyframe request loop (port closed)")
 			return
 		}
 	}
@@ -922,21 +956,36 @@ func (p *MediaPort) videoPLILoop(pliInterval time.Duration) {
 func (p *MediaPort) videoReadStream(log logger.Logger, r rtp.ReadStream, sink *h264StreamIn) {
 	buf := make([]byte, rtp.MTUSize+1)
 	var h rtp.Header
+	var pktCount uint64
 	for {
 		h = rtp.Header{}
 		n, err := r.ReadRTP(&h, buf)
 		if err == io.EOF {
+			log.Infow("video RTP stream ended (EOF)", "packets_received", pktCount)
 			return
 		} else if err != nil {
-			log.Debugw("read video RTP failed", "error", err)
+			log.Infow("video RTP stream read error", "error", err, "packets_received", pktCount)
 			return
 		}
 		p.lastPacketTime.Store(time.Now().UnixNano())
 		if n > rtp.MTUSize {
+			log.Warnw("video RTP packet too large, dropped", nil, "size", n)
 			continue
 		}
+		pktCount++
+		// Log the first 5 packets, then every 200 so we can confirm traffic is flowing.
+		if pktCount <= 5 || pktCount%200 == 0 {
+			log.Infow("video RTP packet received",
+				"pkt_count", pktCount,
+				"seq", h.SequenceNumber,
+				"ts", h.Timestamp,
+				"payload_type", h.PayloadType,
+				"payload_len", n,
+				"marker", h.Marker,
+			)
+		}
 		if err := sink.HandleRTP(&h, buf[:n]); err != nil {
-			log.Debugw("handle video RTP failed", "error", err)
+			log.Warnw("handle video RTP failed", err, "pkt_count", pktCount)
 		}
 	}
 }

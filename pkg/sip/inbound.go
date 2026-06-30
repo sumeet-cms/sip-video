@@ -1532,22 +1532,40 @@ func (c *inboundCall) publishVideoTrack() error {
 	if err != nil {
 		return err
 	}
+	// From this point onward, inbound H.264 frames from Cisco will be forwarded
+	// to the LiveKit track.  Any frames that arrived before this call were
+	// dropped — those will have been logged as "no LiveKit callback yet" warnings.
+	c.log().Infow("video track published — setting WriteVideoTo callback")
 	c.media.WriteVideoTo(vw.WriteSample)
-	// The LiveKit track callback is now live.  The initial IDR from Cisco was
-	// almost certainly dropped while we were joining the room (videoOnSample was
-	// nil during that window).  Request a fresh keyframe so Cisco re-emits an
-	// IDR that the decoder can actually use.  A second PLI fires 1 s later in
-	// case Cisco needs extra time to respond (e.g. encoder not yet started).
+	c.log().Infow("WriteVideoTo set — requesting initial keyframe from Cisco (SIP INFO + RTCP PLI)")
+	// Fire both a SIP INFO picture fast update (RFC 5168) and an RTCP PLI.
+	// SIP INFO travels over TCP and is more reliable for Cisco behind NAT;
+	// RTCP PLI is the standard path for other endpoints.
 	go func() {
-		if err := c.media.RequestVideoPLI(); err != nil {
-			c.log().Debugw("initial video PLI failed", "err", err)
-		}
+		c.requestVideoKeyframe()
 		time.Sleep(time.Second)
-		if err := c.media.RequestVideoPLI(); err != nil {
-			c.log().Debugw("follow-up video PLI failed", "err", err)
-		}
+		c.log().Infow("sending follow-up keyframe request (+1 s)")
+		c.requestVideoKeyframe()
 	}()
 	return nil
+}
+
+// requestVideoKeyframe requests a fresh IDR from Cisco via both SIP INFO
+// (RFC 5168 picture fast update — reliable, travels over TCP) and RTCP PLI
+// (RFC 4585 — UDP, may be blocked by NAT/firewall).
+// Both are sent so the first one to arrive triggers the IDR.
+func (c *inboundCall) requestVideoKeyframe() {
+	// SIP INFO picture fast update (more reliable for Cisco/Tandberg behind NAT).
+	if c.cc != nil {
+		c.log().Infow("sending SIP INFO picture fast update (RFC 5168)")
+		if err := c.cc.sendInfoPictureFastUpdate(c.ctx); err != nil {
+			c.log().Warnw("SIP INFO picture fast update failed", err)
+		}
+	}
+	// RTCP PLI (standard path; may not reach Cisco if UDP port+1 is blocked).
+	if err := c.media.RequestVideoPLI(); err != nil {
+		c.log().Warnw("RTCP PLI failed", err)
+	}
 }
 
 // setupVideo negotiates an H.264 m=video answer when the remote offered video.
@@ -1580,6 +1598,9 @@ func (c *inboundCall) setupVideo(offerData []byte, answerSDP *pionsdp.SessionDes
 		rejectVideo(answerSDP, offered)
 		return err
 	}
+	// Register the keyframe callback before RTP arrives so the periodic loop
+	// uses it.  It sends both SIP INFO (RFC 5168) and RTCP PLI (RFC 4585).
+	mp.SetVideoKeyframeCallback(c.requestVideoKeyframe)
 	c.lkRoom.SwapVideoOutput(mp.GetVideoWriter())
 	addVideoAnswer(answerSDP, mp.VideoPort(), v)
 	c.videoEnabled = true
@@ -2138,6 +2159,57 @@ func (c *sipInbound) setCSeq(req *sip.Request) {
 	setCSeq(req, c.nextRequestCSeq)
 
 	c.nextRequestCSeq++
+}
+
+// sipInfoPictureFastUpdateBody is the RFC 5168 XML body for a SIP INFO
+// "Video Fast Update" request.  Cisco/Tandberg endpoints respond by emitting
+// a fresh IDR (keyframe) on their video encoder, identical to the effect of
+// RTCP PLI but delivered over the reliable SIP/TCP signaling channel.
+const sipInfoPictureFastUpdateBody = `<?xml version="1.0" encoding="utf-8"?>
+<media_control>
+  <vc_primitive>
+    <to_encoder>
+      <picture_fast_update/>
+    </to_encoder>
+  </vc_primitive>
+</media_control>`
+
+// sendInfoPictureFastUpdate sends a SIP INFO request with a "Video Fast
+// Update" body (RFC 5168) to the remote Cisco/Tandberg endpoint.
+//
+// Cisco DX80 and most Tandberg/Cisco TelePresence devices honour this message
+// and respond by emitting a fresh IDR frame on their video encoder.  This is
+// more reliable than RTCP PLI for Cisco devices behind NAT because:
+//   - It travels over the existing SIP/TCP connection (guaranteed delivery)
+//   - RTCP UDP port+1 is often blocked by corporate firewalls
+func (c *sipInbound) sendInfoPictureFastUpdate(ctx context.Context) error {
+	ctx = context.WithoutCancel(ctx)
+	if c.inviteOk == nil || c.invite == nil {
+		return nil // call not established
+	}
+	r := sip.NewRequest(sip.INFO, c.invite.Recipient)
+	r.SipVersion = c.invite.SipVersion
+	sip.CopyHeaders("Via", c.invite, r)
+	if hop := r.Via(); hop != nil {
+		hop.Params.Add("branch", sip.GenerateBranch())
+	}
+	sip.CopyHeaders("From", c.invite, r)
+	sip.CopyHeaders("To", c.invite, r)
+	if tag := c.inviteOk.To(); tag != nil {
+		if toHdr := r.To(); toHdr != nil {
+			if t, ok := tag.Params.Get("tag"); ok {
+				toHdr.Params.Add("tag", t)
+			}
+		}
+	}
+	sip.CopyHeaders("Call-ID", c.invite, r)
+	c.setCSeq(r)
+	ct := sip.ContentTypeHeader("application/media_control+xml")
+	r.AppendHeader(&ct)
+	r.SetBody([]byte(sipInfoPictureFastUpdateBody))
+	c.swapSrcDst(r)
+	_, err := c.Transaction(r)
+	return err
 }
 
 func (c *sipInbound) sendBye(ctx context.Context) {
