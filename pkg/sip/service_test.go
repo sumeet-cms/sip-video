@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -172,12 +173,65 @@ func testInvite(t *testing.T, h Handler, hidden bool, from, to string, test func
 	inviteRequest.SetDestination(sipServerAddress)
 	inviteRequest.SetBody(offerData)
 	inviteRequest.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	inviteRequest.AppendHeader(sip.NewHeader("User-Agent", from))
 
 	tx, err := sipClient.TransactionRequest(inviteRequest)
 	require.NoError(t, err)
 	t.Cleanup(tx.Terminate)
 
 	test(tx)
+}
+
+func TestBlockedInviteUserAgent(t *testing.T) {
+	cases := []struct {
+		name    string
+		ua      string
+		blocked bool
+	}{
+		{name: "friendly scanner", ua: "friendly-scanner", blocked: true},
+		{name: "sipvicious version", ua: "sipvicious/0.3.4", blocked: true},
+		{name: "generic voip exact", ua: "VOIP", blocked: true},
+		{name: "generic voip whitespace", ua: "  VOIP  ", blocked: true},
+		{name: "yealink phone", ua: "Yealink SIP-T46S 66.86.0.15", blocked: false},
+		{name: "voip as part of legitimate ua", ua: "Grandstream VoIP Phone", blocked: false},
+		{name: "empty", ua: "", blocked: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := sip.NewRequest(sip.INVITE, sip.Uri{Host: "example.com"})
+			if tc.ua != "" {
+				req.AppendHeader(sip.NewHeader("User-Agent", tc.ua))
+			}
+			ua, blocked := blockedInviteUserAgent(req)
+			require.Equal(t, tc.blocked, blocked)
+			if tc.blocked {
+				require.Equal(t, strings.TrimSpace(tc.ua), ua)
+			}
+		})
+	}
+}
+
+func TestService_BlockedInviteUserAgent(t *testing.T) {
+	var authCalls atomic.Int32
+	h := &TestHandler{
+		GetAuthCredentialsFunc: func(ctx context.Context, call *rpc.SIPCall) (AuthInfo, error) {
+			authCalls.Add(1)
+			return AuthInfo{Result: AuthAccept}, nil
+		},
+	}
+
+	testInvite(t, h, false, "VOIP", "bar", func(tx sip.ClientTransaction) {
+		var res *sip.Response
+		for {
+			res = getResponseOrFail(t, tx)
+			if res.StatusCode >= 200 {
+				break
+			}
+		}
+		require.Equal(t, sip.StatusCode(403), res.StatusCode)
+		require.Equal(t, int32(0), authCalls.Load())
+	})
 }
 
 func TestService_AuthFailure(t *testing.T) {

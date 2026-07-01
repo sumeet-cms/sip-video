@@ -77,6 +77,23 @@ var allowHeader = sip.NewHeader("Allow", "INVITE, ACK, CANCEL, BYE, NOTIFY, REFE
 
 var errNoACK = errors.New("no ACK received for 200 OK")
 
+var blockedInviteUserAgentSubstrings = []string{
+	"friendly-scanner",
+	"sipvicious",
+	"sipcli",
+	"sipsak",
+	"vaxsip",
+	"pplsip",
+	"sundayddr",
+	"iwar",
+	"sip-scan",
+	"scanner",
+}
+
+var blockedInviteUserAgentExact = map[string]struct{}{
+	"voip": {},
+}
+
 // hashPassword creates a SHA256 hash of the password for logging purposes
 func hashPassword(password string) string {
 	if password == "" {
@@ -88,6 +105,27 @@ func hashPassword(password string) string {
 
 func generateNonce(sipCallID string) string {
 	return fmt.Sprintf("%d-%s", time.Now().UnixMicro(), sipCallID)
+}
+
+func blockedInviteUserAgent(req *sip.Request) (string, bool) {
+	h := req.GetHeader("User-Agent")
+	if h == nil {
+		return "", false
+	}
+	ua := strings.TrimSpace(h.Value())
+	if ua == "" {
+		return "", false
+	}
+	normalized := strings.ToLower(ua)
+	if _, ok := blockedInviteUserAgentExact[normalized]; ok {
+		return ua, true
+	}
+	for _, needle := range blockedInviteUserAgentSubstrings {
+		if strings.Contains(normalized, needle) {
+			return ua, true
+		}
+	}
+	return "", false
 }
 
 type inboundCallInfo struct {
@@ -365,6 +403,12 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 	tid := traceid.FromGUID(string(cc.ID()))
 	log := cc.log.WithValues("transport", tr, "tid", tid.String())
 	cc.log = log
+
+	if ua, blocked := blockedInviteUserAgent(req); blocked {
+		log.Warnw("rejecting invite from blocked User-Agent", nil, "user_agent", ua)
+		cc.RespondAndDrop(sip.StatusForbidden, "Forbidden")
+		return psrpc.NewErrorf(psrpc.PermissionDenied, "blocked invite user agent")
+	}
 
 	// Replay cached final rejection for retries reusing the same Call-ID +
 	// From-tag (e.g. provider-level failover after a 4xx). Skips creating
