@@ -15,9 +15,11 @@
 package sip
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/xml"
 	"fmt"
 	"log/slog"
 	"math"
@@ -1557,8 +1559,14 @@ func (c *inboundCall) publishVideoTrack() error {
 func (c *inboundCall) requestVideoKeyframe() {
 	// SIP INFO picture fast update (more reliable for Cisco/Tandberg behind NAT).
 	if c.cc != nil {
-		c.log().Infow("sending SIP INFO picture fast update (RFC 5168)")
-		if err := c.cc.sendInfoPictureFastUpdate(c.ctx); err != nil {
+		streamID := ""
+		if c.media != nil {
+			if v := c.media.VideoConfig(); v != nil {
+				streamID = v.StreamID
+			}
+		}
+		c.log().Infow("sending SIP INFO picture fast update (RFC 5168)", "stream_id", streamID)
+		if err := c.cc.sendInfoPictureFastUpdate(c.ctx, streamID); err != nil {
 			c.log().Warnw("SIP INFO picture fast update failed", err)
 		}
 	}
@@ -2184,18 +2192,22 @@ func (c *sipInbound) setCSeq(req *sip.Request) {
 	c.nextRequestCSeq++
 }
 
-// sipInfoPictureFastUpdateBody is the RFC 5168 XML body for a SIP INFO
+// sipInfoPictureFastUpdateBody returns the RFC 5168 XML body for a SIP INFO
 // "Video Fast Update" request.  Cisco/Tandberg endpoints respond by emitting
 // a fresh IDR (keyframe) on their video encoder, identical to the effect of
 // RTCP PLI but delivered over the reliable SIP/TCP signaling channel.
-const sipInfoPictureFastUpdateBody = `<?xml version="1.0" encoding="utf-8"?>
-<media_control>
-  <vc_primitive>
-    <to_encoder>
-      <picture_fast_update/>
-    </to_encoder>
-  </vc_primitive>
-</media_control>`
+func sipInfoPictureFastUpdateBody(streamID string) []byte {
+	var b bytes.Buffer
+	b.WriteString(`<?xml version="1.0" encoding="utf-8" ?>`)
+	b.WriteString(`<media_control><vc_primitive><to_encoder><picture_fast_update></picture_fast_update></to_encoder>`)
+	if streamID != "" {
+		b.WriteString(`<stream_id>`)
+		_ = xml.EscapeText(&b, []byte(streamID))
+		b.WriteString(`</stream_id>`)
+	}
+	b.WriteString(`</vc_primitive></media_control>`)
+	return b.Bytes()
+}
 
 // sendInfoPictureFastUpdate sends a SIP INFO request with a "Video Fast
 // Update" body (RFC 5168) to the remote Cisco/Tandberg endpoint.
@@ -2205,9 +2217,9 @@ const sipInfoPictureFastUpdateBody = `<?xml version="1.0" encoding="utf-8"?>
 // more reliable than RTCP PLI for Cisco devices behind NAT because:
 //   - It travels over the existing SIP/TCP connection (guaranteed delivery)
 //   - RTCP UDP port+1 is often blocked by corporate firewalls
-func (c *sipInbound) sendInfoPictureFastUpdate(ctx context.Context) error {
+func (c *sipInbound) sendInfoPictureFastUpdate(ctx context.Context, streamID string) error {
 	ctx = context.WithoutCancel(ctx)
-	r := c.newInfoPictureFastUpdateReq()
+	r := c.newInfoPictureFastUpdateReq(streamID)
 	if r == nil {
 		return nil // call not established
 	}
@@ -2215,7 +2227,7 @@ func (c *sipInbound) sendInfoPictureFastUpdate(ctx context.Context) error {
 	return err
 }
 
-func (c *sipInbound) newInfoPictureFastUpdateReq() *sip.Request {
+func (c *sipInbound) newInfoPictureFastUpdateReq(streamID string) *sip.Request {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.inviteOk == nil || c.invite == nil {
@@ -2240,7 +2252,7 @@ func (c *sipInbound) newInfoPictureFastUpdateReq() *sip.Request {
 	c.setCSeq(r)
 	ct := sip.ContentTypeHeader("application/media_control+xml")
 	r.AppendHeader(&ct)
-	r.SetBody([]byte(sipInfoPictureFastUpdateBody))
+	r.SetBody(sipInfoPictureFastUpdateBody(streamID))
 	c.swapSrcDst(r)
 	return r
 }

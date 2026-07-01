@@ -138,6 +138,7 @@ func TestParseVideoOfferCiscoComplex(t *testing.T) {
 	assert.Equal(t, "428014", v.ProfileLevelID)
 	assert.Equal(t, 1, v.PacketizationMode)
 	assert.Equal(t, "164.100.103.40:45316", v.Remote.String())
+	assert.Equal(t, "11", v.StreamID)
 	// Capacity params from PT 116's fmtp must be preserved for the answer.
 	assert.Contains(t, v.H264FmtpExtra, "max-mbps=489600")
 	assert.Contains(t, v.H264FmtpExtra, "max-fs=8160")
@@ -186,6 +187,7 @@ a=fmtp:97 packetization-mode=0;profile-level-id=428014;max-br=2500;max-mbps=2450
 a=rtpmap:126 H264/90000
 a=fmtp:126 packetization-mode=1;profile-level-id=428014;max-br=2500;max-mbps=122400;max-fs=8160;max-dpb=16320;max-smbps=122400
 a=rtcp-fb:* nack pli
+a=label:11
 a=sendrecv
 `
 
@@ -198,6 +200,7 @@ func TestParseVideoOfferCiscoDX80(t *testing.T) {
 	assert.Equal(t, "428014", v.ProfileLevelID)
 	assert.Equal(t, 1, v.PacketizationMode)
 	assert.Equal(t, "10.1.2.5:2372", v.Remote.String())
+	assert.Equal(t, "11", v.StreamID)
 	// Capacity params from PT 126's fmtp.
 	assert.Contains(t, v.H264FmtpExtra, "max-br=2500")
 	assert.Contains(t, v.H264FmtpExtra, "max-mbps=122400")
@@ -222,6 +225,19 @@ func TestSetVideoAnswerOnLocalSDPCiscoDX80(t *testing.T) {
 	assert.Contains(t, updatedStr, "max-fs=8160")
 	assert.Contains(t, updatedStr, "max-dpb=16320")
 	assert.Contains(t, updatedStr, "max-smbps=122400")
+}
+
+func TestSipInfoPictureFastUpdateBodyWithStreamID(t *testing.T) {
+	body := string(sipInfoPictureFastUpdateBody("11"))
+
+	assert.Contains(t, body, `<picture_fast_update></picture_fast_update>`)
+	assert.Contains(t, body, `<stream_id>11</stream_id>`)
+}
+
+func TestSipInfoPictureFastUpdateBodyEscapesStreamID(t *testing.T) {
+	body := string(sipInfoPictureFastUpdateBody(`cam&main`))
+
+	assert.Contains(t, body, `<stream_id>cam&amp;main</stream_id>`)
 }
 
 // TestH264ProfileLevelIDForResolution verifies that common resolutions map to

@@ -80,6 +80,7 @@ type videoMediaConf struct {
 	// These are appended verbatim to the fmtp line in the SDP answer so that
 	// Cisco/Tandberg endpoints know the bitrate/resolution limits they should honour.
 	H264FmtpExtra string
+	StreamID      string         // media-level a=label, used by Cisco INFO picture-fast-update
 	Local         netip.AddrPort // our local video RTP address
 	Remote        netip.AddrPort // remote video RTP address
 }

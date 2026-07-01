@@ -203,8 +203,18 @@ func parseVideoSession(s *sdp.SessionDescription) (*videoMediaConf, bool) {
 		ProfileLevelID:    profile,
 		PacketizationMode: pktMode,
 		H264FmtpExtra:     extra,
+		StreamID:          videoStreamID(md),
 		Remote:            addr,
 	}, true
+}
+
+func videoStreamID(md *sdp.MediaDescription) string {
+	for _, a := range md.Attributes {
+		if strings.EqualFold(a.Key, "label") {
+			return strings.TrimSpace(a.Value)
+		}
+	}
+	return ""
 }
 
 // h264CapacityParams is the set of H.264 fmtp capacity parameters that are
