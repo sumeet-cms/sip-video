@@ -17,6 +17,7 @@ package sip
 import (
 	"testing"
 
+	"github.com/pion/sdp/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -114,6 +115,18 @@ a=rtpmap:0 PCMU/8000
 `
 	_, ok := parseVideoOffer([]byte(audioOnly))
 	assert.False(t, ok)
+}
+
+func TestAddVideoOfferUsesLocalProfileLevel(t *testing.T) {
+	var desc sdp.SessionDescription
+	require.NoError(t, desc.Unmarshal([]byte(audioOnlyAnswerSDP)))
+
+	addVideoOffer(&desc, 50002, h264ProfileLevelIDForResolution(1920, 1080))
+
+	offer, err := desc.Marshal()
+	require.NoError(t, err)
+	assert.Contains(t, string(offer), "m=video 50002 RTP/AVP 96")
+	assert.Contains(t, string(offer), "a=fmtp:96 profile-level-id=42e028;packetization-mode=1")
 }
 
 func TestParseVideoOfferCiscoComplex(t *testing.T) {

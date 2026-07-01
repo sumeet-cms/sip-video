@@ -59,9 +59,9 @@ const (
 
 // videoMediaConf holds the negotiated SIP video parameters.
 type videoMediaConf struct {
-	Type              byte           // negotiated RTP payload type
-	ClockRate         int            // RTP clock rate (90000)
-	ProfileLevelID    string         // H.264 profile-level-id from remote's SDP offer/answer
+	Type           byte   // negotiated RTP payload type
+	ClockRate      int    // RTP clock rate (90000)
+	ProfileLevelID string // H.264 profile-level-id from remote's SDP offer/answer
 	// LocalProfileLevelID is the profile-level-id we put in OUR SDP answer.
 	// It reflects the actual H.264 level produced by our GStreamer encoder,
 	// computed from the video output config (Width × Height).  If empty,
@@ -74,14 +74,14 @@ type videoMediaConf struct {
 	// a 1920×1080 bitstream Cisco can decode only the top-left corner →
 	// the participant sees "half my video" or a cropped picture.
 	LocalProfileLevelID string
-	PacketizationMode   int            // H.264 packetization-mode from fmtp (default 1)
+	PacketizationMode   int // H.264 packetization-mode from fmtp (default 1)
 	// H264FmtpExtra holds capacity constraints echoed from the remote offer
 	// (e.g. "max-br=2500;max-mbps=122400;max-fs=8160;max-dpb=16320;max-smbps=122400").
 	// These are appended verbatim to the fmtp line in the SDP answer so that
 	// Cisco/Tandberg endpoints know the bitrate/resolution limits they should honour.
-	H264FmtpExtra     string
-	Local             netip.AddrPort // our local video RTP address
-	Remote            netip.AddrPort // remote video RTP address
+	H264FmtpExtra string
+	Local         netip.AddrPort // our local video RTP address
+	Remote        netip.AddrPort // remote video RTP address
 }
 
 // VideoStats tracks video traffic for a single call.
@@ -246,6 +246,12 @@ func (h *h264RTPWriter) WriteVideoSample(s video.Sample) error {
 		}
 	}
 	return nil
+}
+
+func (h *h264RTPWriter) SetPayloadType(pt uint8) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.pt = pt
 }
 
 // h264StreamIn depacketizes inbound SIP H.264 RTP into access units and

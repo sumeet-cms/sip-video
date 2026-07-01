@@ -5,3 +5,13 @@ cmd/server/server
 
 test/config.yaml
 test/*/*.mkv
+
+# Generated SIP video test outputs.
+sip_video_testing/capture*.pcap
+sip_video_testing/media/*.pcap
+sip_video_testing/received_audio.wav
+sip_video_testing/received_video.*
+sip_video_testing/*_messages.log
+sip_video_testing/*_errors.log
+sip_video_testing/tools/__pycache__/
+*.pyc

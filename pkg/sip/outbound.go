@@ -540,6 +540,8 @@ func (c *outboundCall) prepareReinviteOffer(offerData []byte) ([]byte, *videoMed
 	if len(localSDP) == 0 {
 		return nil, nil, nil
 	}
+	cfg := videoConfigFrom(c.c.conf.Video)
+	v.LocalProfileLevelID = h264ProfileLevelIDForResolution(cfg.Width, cfg.Height)
 	updatedLocalSDP, err := setVideoAnswerOnLocalSDP(localSDP, c.media.VideoPort(), v)
 	if err != nil {
 		return nil, nil, err
@@ -549,6 +551,16 @@ func (c *outboundCall) prepareReinviteOffer(offerData []byte) ([]byte, *videoMed
 
 func (c *outboundCall) applyReinviteVideo(v *videoMediaConf) {
 	if v == nil || c.stopped.IsBroken() {
+		return
+	}
+	cfg := videoConfigFrom(c.c.conf.Video)
+	v.LocalProfileLevelID = h264ProfileLevelIDForResolution(cfg.Width, cfg.Height)
+	if c.videoEnabled {
+		if err := c.media.UpdateVideoConfig(v); err != nil {
+			c.log.Warnw("cannot update reinvite video changes", err)
+			return
+		}
+		c.media.EnableVideoOut()
 		return
 	}
 	if err := c.setupOutboundVideo(v); err != nil {
@@ -663,7 +675,8 @@ func (c *outboundCall) sipSignal(ctx context.Context, tid traceid.ID) error {
 		return err
 	}
 	if c.media.VideoEnabled() {
-		addVideoOffer(&sdpOffer.SDP, c.media.VideoPort())
+		cfg := videoConfigFrom(c.c.conf.Video)
+		addVideoOffer(&sdpOffer.SDP, c.media.VideoPort(), h264ProfileLevelIDForResolution(cfg.Width, cfg.Height))
 	}
 	sdpOfferData, err := sdpOffer.SDP.Marshal()
 	if err != nil {

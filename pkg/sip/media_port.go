@@ -462,17 +462,18 @@ type MediaPort struct {
 
 	// Video (H.264) leg. Allocated only when MediaOptions.EnableVideo is set
 	// and negotiated via SetVideoConfig.
-	videoPort       *udpConn
-	videoSess       rtp.Session
-	videoConf       *videoMediaConf
-	videoOut        *gatedVideoWriter  // LK H.264 sample -> SIP RTP
-	videoSink       *h264StreamIn      // SIP RTP -> LK H.264 sample
-	videoOnSample           atomic.Pointer[func(media.Sample) error]
+	videoPort     *udpConn
+	videoSess     rtp.Session
+	videoConf     *videoMediaConf
+	videoOut      *gatedVideoWriter // LK H.264 sample -> SIP RTP
+	videoOutRTP   *h264RTPWriter    // current RTP packetizer behind videoOut
+	videoSink     *h264StreamIn     // SIP RTP -> LK H.264 sample
+	videoOnSample atomic.Pointer[func(media.Sample) error]
 	// onVideoKeyframeRequest, if set, is called every videoPLIInterval instead
 	// of plain RTCP PLI.  inboundCall sets this to also send a SIP INFO picture
 	// fast update (RFC 5168), which is more reliable for Cisco behind NAT.
-	onVideoKeyframeRequest  atomic.Pointer[func()]
-	videoStats              *VideoStats
+	onVideoKeyframeRequest atomic.Pointer[func()]
+	videoStats             *VideoStats
 	// SSRC of the remote video sender (Cisco/SIP endpoint).  Populated by
 	// videoRTPLoop once the first RTP stream is accepted; used by
 	// RequestVideoPLI to address the RTCP feedback packet correctly.
@@ -814,6 +815,7 @@ func (p *MediaPort) SetVideoConfig(v *videoMediaConf) error {
 	}
 	fps := p.opts.VideoFPS
 	out := newH264RTPWriter(w, v.Type, v.ClockRate, fps, p.videoStats)
+	p.videoOutRTP = out
 	p.videoOut.Swap(out)
 
 	// Inbound: RTP -> H.264 access units -> registered callback.
@@ -831,6 +833,32 @@ func (p *MediaPort) SetVideoConfig(v *videoMediaConf) error {
 		_ = (*cb)(s)
 	}, p.videoStats, portLog.WithValues("component", "h264-depacketizer"))
 	go p.videoRTPLoop(sess, p.videoSink)
+	return nil
+}
+
+// UpdateVideoConfig applies re-INVITE changes to an already configured video
+// session without recreating RTP loops or LiveKit tracks.
+func (p *MediaPort) UpdateVideoConfig(v *videoMediaConf) error {
+	if p.videoPort == nil || v == nil {
+		return nil
+	}
+	if p.closed.IsBroken() {
+		return errors.New("media is already closed")
+	}
+	p.videoPort.SetDst(v.Remote)
+	if p.opts.IgnoreLocalAddrInSDP && v.Remote.Addr().IsPrivate() {
+		p.videoPort.SetSymmetric(true)
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.videoSess == nil || p.videoOutRTP == nil {
+		return errors.New("video is not configured")
+	}
+	p.log.Infow("updating video codec", "video-rtp", v.Type, "profile", v.ProfileLevelID,
+		"packetization-mode", v.PacketizationMode, "remote", v.Remote.String())
+	p.videoConf = v
+	p.videoOutRTP.SetPayloadType(v.Type)
 	return nil
 }
 

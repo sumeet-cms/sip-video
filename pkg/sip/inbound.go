@@ -2207,6 +2207,17 @@ const sipInfoPictureFastUpdateBody = `<?xml version="1.0" encoding="utf-8"?>
 //   - RTCP UDP port+1 is often blocked by corporate firewalls
 func (c *sipInbound) sendInfoPictureFastUpdate(ctx context.Context) error {
 	ctx = context.WithoutCancel(ctx)
+	r := c.newInfoPictureFastUpdateReq()
+	if r == nil {
+		return nil // call not established
+	}
+	_, err := c.Transaction(r)
+	return err
+}
+
+func (c *sipInbound) newInfoPictureFastUpdateReq() *sip.Request {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.inviteOk == nil || c.invite == nil {
 		return nil // call not established
 	}
@@ -2231,8 +2242,7 @@ func (c *sipInbound) sendInfoPictureFastUpdate(ctx context.Context) error {
 	r.AppendHeader(&ct)
 	r.SetBody([]byte(sipInfoPictureFastUpdateBody))
 	c.swapSrcDst(r)
-	_, err := c.Transaction(r)
-	return err
+	return r
 }
 
 func (c *sipInbound) sendBye(ctx context.Context) {

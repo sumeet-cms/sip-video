@@ -63,8 +63,12 @@ func h264ProfileLevelIDForResolution(width, height int) string {
 }
 
 // addVideoOffer appends an H.264 m=video offer to s, advertising the given
-// local RTP port. The session-level connection address is reused.
-func addVideoOffer(s *sdp.SessionDescription, port int) {
+// local RTP port and encoder H.264 profile level. The session-level connection
+// address is reused.
+func addVideoOffer(s *sdp.SessionDescription, port int, profileLevelID string) {
+	if profileLevelID == "" {
+		profileLevelID = defaultH264ProfileLevelID
+	}
 	pt := strconv.Itoa(defaultH264PayloadType)
 	md := &sdp.MediaDescription{
 		MediaName: sdp.MediaName{
@@ -76,7 +80,7 @@ func addVideoOffer(s *sdp.SessionDescription, port int) {
 		Attributes: []sdp.Attribute{
 			{Key: "rtpmap", Value: fmt.Sprintf("%s %s/%d", pt, h264SDPName, VideoClockRate)},
 			{Key: "fmtp", Value: fmt.Sprintf("%s profile-level-id=%s;packetization-mode=%d;level-asymmetry-allowed=1",
-				pt, defaultH264ProfileLevelID, defaultH264PacketizationMode)},
+				pt, profileLevelID, defaultH264PacketizationMode)},
 			{Key: "rtcp-fb", Value: pt + " nack pli"},
 			{Key: "sendrecv"},
 		},
@@ -223,11 +227,11 @@ var h264CapacityParams = map[string]struct{}{
 // be echoed in the SDP answer.
 func selectH264(md *sdp.MediaDescription) (pt byte, profileLevelID string, packetizationMode int, fmtpExtra string, ok bool) {
 	type candidate struct {
-		pt                    int
-		profileLevelID        string
-		packetizationMode     int
-		packetModeExplicit    bool   // true when packetization-mode appeared in fmtp
-		extra                 string // semicolon-joined capacity params
+		pt                 int
+		profileLevelID     string
+		packetizationMode  int
+		packetModeExplicit bool   // true when packetization-mode appeared in fmtp
+		extra              string // semicolon-joined capacity params
 	}
 
 	// First pass: collect all H.264 PTs in offer order.
